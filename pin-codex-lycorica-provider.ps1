@@ -16,10 +16,15 @@
   provider (WebSocket-capable) and fights the custom provider pin.
 
 .PARAMETER Watch
-  Stay resident and re-pin after every config.toml change (poll + timestamp).
+  Stay resident and re-pin on config.toml changes via FileSystemWatcher
+  (event-driven; idle CPU near zero — not a poll loop).
 
 .PARAMETER ConfigPath
   Override path to config.toml (default: $env:USERPROFILE\.codex\config.toml).
+
+.PARAMETER DebounceMs
+  Wait this long after a filesystem event before reading/writing, so Codex can
+  finish its rewrite. Default 400ms.
 #>
 [CmdletBinding()]
 param(
@@ -27,7 +32,7 @@ param(
     [string]$ConfigPath = $(Join-Path $env:USERPROFILE ".codex\config.toml"),
     [string]$ProviderId = "lycorica",
     [string]$BaseUrl = "https://cursor.lycorica.com/cursor/v1",
-    [int]$PollMs = 750
+    [int]$DebounceMs = 400
 )
 
 $ErrorActionPreference = "Stop"
@@ -124,21 +129,40 @@ if (-not $Watch) {
     exit 0
 }
 
-Write-Host "Watching $ConfigPath every ${PollMs}ms (Ctrl+C to stop)..."
-$lastWrite = $null
+$dir = Split-Path -Parent $ConfigPath
+$name = Split-Path -Leaf $ConfigPath
+if (-not (Test-Path -LiteralPath $dir)) {
+    throw "Config directory not found: $dir"
+}
+
+$watcher = New-Object System.IO.FileSystemWatcher $dir, $name
+$watcher.NotifyFilter = [IO.NotifyFilters]::LastWrite -bor [IO.NotifyFilters]::Size -bor [IO.NotifyFilters]::FileName
+$watcher.IncludeSubdirectories = $false
+$watcher.EnableRaisingEvents = $false
+
+$changeTypes =
+    [IO.WatcherChangeTypes]::Changed -bor
+    [IO.WatcherChangeTypes]::Created -bor
+    [IO.WatcherChangeTypes]::Renamed
+
+Write-Host "Watching $ConfigPath via FileSystemWatcher (Ctrl+C to stop)..."
 try {
     while ($true) {
-        if (Test-Path -LiteralPath $ConfigPath) {
-            $write = (Get-Item -LiteralPath $ConfigPath).LastWriteTimeUtc
-            if ($lastWrite -eq $null -or $write -ne $lastWrite) {
-                # Let Codex finish its rewrite before we patch.
-                Start-Sleep -Milliseconds 300
-                [void](Invoke-PinCodexProvider -Path $ConfigPath -Id $ProviderId -Url $BaseUrl)
-                $lastWrite = (Get-Item -LiteralPath $ConfigPath).LastWriteTimeUtc
-            }
+        # Blocks until the OS reports a change — no polling.
+        $null = $watcher.WaitForChanged($changeTypes)
+        Start-Sleep -Milliseconds $DebounceMs
+        # Drain bursty multi-event writes from the same save.
+        while ($true) {
+            $extra = $watcher.WaitForChanged($changeTypes, 150)
+            if ($extra.TimedOut) { break }
         }
-        Start-Sleep -Milliseconds $PollMs
+        try {
+            [void](Invoke-PinCodexProvider -Path $ConfigPath -Id $ProviderId -Url $BaseUrl)
+        } catch {
+            Write-Warning $_.Exception.Message
+        }
     }
 } finally {
+    $watcher.Dispose()
     Write-Host "Watcher stopped."
 }

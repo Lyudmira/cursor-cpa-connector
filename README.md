@@ -166,7 +166,7 @@ cd C:\CLIProxyAPI\patches\cursor-cpa-connector
 .\pin-codex-lycorica-provider.ps1
 ```
 
-Keep it pinned across UI writebacks (recommended while using Codex):
+Keep it pinned across UI writebacks (recommended while using Codex). `-Watch` uses `FileSystemWatcher` (blocks on OS file events; idle CPU near zero — not a poll loop):
 
 ```powershell
 .\pin-codex-lycorica-provider.ps1 -Watch
@@ -193,7 +193,7 @@ UI-owned keys above that trailer stay free to change. Override provider id / URL
 | `install-cursor-cpa-bifrost-patches.ps1` | Clone/patch/build CPA and Bifrost; optional `-InitConfig` |
 | `init-config.ps1` | Interactive (default) or `-UseEnv` upstream wiring into `config.db` / CPA `api-keys` |
 | `init_bifrost_config.py` | SQLite helper used by `init-config.ps1` |
-| `pin-codex-lycorica-provider.ps1` | Re-pin lycorica `supports_websockets = false` trailer after Codex UI config rewrite; optional `-Watch` |
+| `pin-codex-lycorica-provider.ps1` | Re-pin lycorica `supports_websockets = false` trailer after Codex UI config rewrite; optional event-driven `-Watch` |
 | `.env.example` | Template for `-UseEnv` only |
 | `codex_openai_responses_request.go` | Full Responses **request** translator patch |
 | `codex_openai_response.go` | Chat-completions response patch (PR #4079) |
