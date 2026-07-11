@@ -68,6 +68,7 @@ Regex patch on `core/schemas/responses.go` (via the install script):
 - `ResponsesToolTypeFunction`: fallback to `raw["function"]` and `raw["input_schema"]`.
 - `Strict *bool` json tag gets `omitempty`.
 - Cursor `function_call_output.output[]` content aliases `text` / `output_text` are normalized to `input_text` before provider forwarding.
+- Claude Cursor requests with tools receive one `cache_control: {"type":"ephemeral"}` breakpoint on the final tool when the client did not provide an explicit cache policy. The Responses-to-Chat conversion preserves that marker for OpenAI-compatible Claude upstreams.
 
 ## Install mechanism
 
@@ -121,6 +122,10 @@ Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:8317/v1/responses" -Me
 ```
 
 Expect HTTP 200. Before the patch, Codex rejects `input[n].role` or `output[].type: "text"`.
+
+### Claude tool-prefix caching
+
+For a Claude model routed through Bifrost, send the same stable tool list at least twice and inspect `logs.db`. The forwarded request parameters should contain exactly one cache breakpoint on the final tool. A positive `cached_read_tokens` value confirms that the upstream accepted and reused the cached prefix. Some OpenAI-compatible providers may preserve the marker but still report zero cache reads; that indicates an upstream cache implementation or accounting limitation rather than marker loss inside Bifrost.
 
 ## Troubleshooting: Codex WebSocket to `/v1/responses`
 

@@ -236,7 +236,28 @@ function Apply-Bifrost-Patch([string]$SourceRoot) {
     $content = Get-Content -Raw -LiteralPath $responsesGo
     $content = $content -replace 'Strict\s+\*bool\s+`json:"strict"`', 'Strict     *bool                   `json:"strict,omitempty"`'
 
-    $casePattern = '(?s)case ResponsesToolTypeFunction:\s*.*?\s*case ResponsesToolTypeFileSearch:'
+    $muxGo = Join-Path $SourceRoot "core\schemas\mux.go"
+    if (-not (Test-Path $muxGo)) {
+        throw "Bifrost mux.go not found: $muxGo"
+    }
+    $muxContent = Get-Content -Raw -LiteralPath $muxGo
+    if ($muxContent -notmatch 'rt.CacheControl = ct.CacheControl') {
+        $muxContent = $muxContent.Replace("`trt := &ResponsesTool{`r`n`t`tType: ResponsesToolType(ct.Type),`r`n`t}", "`trt := &ResponsesTool{`r`n`t`tType:         ResponsesToolType(ct.Type),`r`n`t`tCacheControl: ct.CacheControl,`r`n`t}")
+    }
+    if ($muxContent -notmatch 'ct.CacheControl = rt.CacheControl') {
+        $muxContent = $muxContent.Replace("`tct := &ChatTool{`r`n`t`tType: ChatToolType(rt.Type),`r`n`t}", "`tct := &ChatTool{`r`n`t`tType:         ChatToolType(rt.Type),`r`n`t`tCacheControl: rt.CacheControl,`r`n`t}")
+    }
+    if ($muxContent -notmatch 'CacheControl: ct.CacheControl' -or $muxContent -notmatch 'CacheControl: rt.CacheControl') {
+        throw "Could not patch Responses/Chat tool cache_control conversion in $muxGo"
+    }
+    Save-Utf8NoBom $muxGo $muxContent
+
+    $unmarshalStart = $content.IndexOf('func (t *ResponsesTool) UnmarshalJSON(data []byte) error {')
+    if ($unmarshalStart -lt 0) {
+        throw "Could not locate ResponsesTool.UnmarshalJSON in $responsesGo"
+    }
+    $unmarshalContent = $content.Substring($unmarshalStart)
+    $casePattern = '(?s)case ResponsesToolTypeFunction:\s*var funcTool ResponsesToolFunction\s*if err := Unmarshal\(data, &funcTool\); err != nil \{\s*return err\s*\}\s*t\.ResponsesToolFunction = &funcTool\s*case ResponsesToolTypeFileSearch:'
     $caseReplacement = @'
 case ResponsesToolTypeFunction:
 		// Chat Completions nests function metadata under "function"; Responses API
@@ -300,11 +321,26 @@ case ResponsesToolTypeFunction:
 
 	case ResponsesToolTypeFileSearch:
 '@
-    if ($content -notmatch "parsedCacheControl") {
-        if ($content -notmatch $casePattern) {
-            throw "Could not locate ResponsesToolTypeFunction switch block in $responsesGo"
+    if ($unmarshalContent -notmatch 'Cursor flat format uses input_schema') {
+        if ($unmarshalContent -notmatch $casePattern) {
+            throw "Could not locate unpatched ResponsesToolTypeFunction case in ResponsesTool.UnmarshalJSON: $responsesGo"
         }
-        $content = [regex]::Replace($content, $casePattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $caseReplacement }, 1)
+        $patchedUnmarshal = [regex]::Replace($unmarshalContent, $casePattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $caseReplacement }, 1)
+        $content = $content.Substring(0, $unmarshalStart) + $patchedUnmarshal
+    }
+
+    $marshalStart = $content.IndexOf('func (t ResponsesTool) MarshalJSON() ([]byte, error) {')
+    $unmarshalStart = $content.IndexOf('func (t *ResponsesTool) UnmarshalJSON(data []byte) error {')
+    if ($marshalStart -lt 0 -or $unmarshalStart -le $marshalStart) {
+        throw "Unexpected ResponsesTool marshal/unmarshal structure in $responsesGo"
+    }
+    $marshalContent = $content.Substring($marshalStart, $unmarshalStart - $marshalStart)
+    if ($marshalContent -match 'fnRaw|Cursor flat format uses input_schema') {
+        throw "Cursor compatibility code leaked into ResponsesTool.MarshalJSON: $responsesGo"
+    }
+    $unmarshalContent = $content.Substring($unmarshalStart)
+    if ([regex]::Matches($unmarshalContent, 'Cursor flat format uses input_schema').Count -ne 1) {
+        throw "Expected exactly one Cursor function-tool compatibility block in ResponsesTool.UnmarshalJSON: $responsesGo"
     }
     Save-Utf8NoBom $responsesGo $content
 
@@ -344,11 +380,90 @@ func normalizeCursorFunctionCallOutputs(req *openai.OpenAIResponsesRequest) {
         Save-Utf8NoBom $cursorGo $cursorContent
     }
 
+    $cursorContent = Get-Content -Raw -LiteralPath $cursorGo
+    if ($cursorContent -notmatch "addCursorClaudeToolCacheBreakpoint") {
+        $happyPathPattern = 'normalizeInputContentBlocks\(cursorReq\)\r?\n\s*return nil'
+        if ($cursorContent -notmatch $happyPathPattern) {
+            throw "Could not locate Cursor parser happy-path return in $cursorGo"
+        }
+        $cursorContent = [regex]::Replace($cursorContent, $happyPathPattern, "normalizeInputContentBlocks(cursorReq)`r`n`t`taddCursorClaudeToolCacheBreakpoint(cursorReq)`r`n`t`treturn nil", 1)
+
+        $fallbackReturnPattern = '(?s)(for i := range toolsWrapper\.Tools \{.*?\r?\n\s*\})\r?\n\s*return nil\r?\n\}'
+        if ($cursorContent -notmatch $fallbackReturnPattern) {
+            throw "Could not locate Cursor flat-tool parser return in $cursorGo"
+        }
+        $cursorContent = [regex]::Replace($cursorContent, $fallbackReturnPattern, "`$1`r`n`r`n`taddCursorClaudeToolCacheBreakpoint(cursorReq)`r`n`treturn nil`r`n}", 1)
+        $cacheMarker = '// normalizeInputContentBlocks ensures all input messages have ContentBlocks instead of'
+        $cacheFunction = @"
+// addCursorClaudeToolCacheBreakpoint adds one Anthropic-compatible cache breakpoint
+// to Cursor's stable tool prefix when the client did not provide one. Limiting the
+// change to Claude requests avoids leaking provider-specific behavior to other models.
+func addCursorClaudeToolCacheBreakpoint(req *openai.OpenAIResponsesRequest) {
+	if req == nil || !strings.HasPrefix(strings.ToLower(req.Model), "claude-") || len(req.Tools) == 0 {
+		return
+	}
+	for i := range req.Tools {
+		if req.Tools[i].CacheControl != nil {
+			return
+		}
+	}
+	req.Tools[len(req.Tools)-1].CacheControl = &schemas.CacheControl{
+		Type: schemas.CacheControlTypeEphemeral,
+	}
+}
+
+"@
+        if (-not $cursorContent.Contains($cacheMarker)) {
+            throw "Could not locate Cursor input normalization marker in $cursorGo"
+        }
+        $cursorContent = $cursorContent.Replace($cacheMarker, $cacheFunction + $cacheMarker)
+        Save-Utf8NoBom $cursorGo $cursorContent
+    }
+
+    $cursorContent = Get-Content -Raw -LiteralPath $cursorGo
+    if ([regex]::Matches($cursorContent, 'addCursorClaudeToolCacheBreakpoint\(cursorReq\)').Count -ne 2) {
+        throw "Expected Claude cache helper calls in both Cursor parser paths: $cursorGo"
+    }
+    if ([regex]::Matches($cursorContent, 'func addCursorClaudeToolCacheBreakpoint').Count -ne 1) {
+        throw "Expected exactly one Claude cache helper definition: $cursorGo"
+    }
+
+    $schemaCompatTest = Join-Path $SourceRoot "core\schemas\cursor_connector_compat_test.go"
+    $cursorCompatTest = Join-Path $SourceRoot "transports\bifrost-http\integrations\cursor_connector_compat_test.go"
+    Copy-Item -Force (Join-Path $PSScriptRoot "bifrost_responses_compat_test.go") $schemaCompatTest
+    Copy-Item -Force (Join-Path $PSScriptRoot "bifrost_cursor_compat_test.go") $cursorCompatTest
+
     Push-Location $SourceRoot
     try {
-        gofmt -w $responsesGo $cursorGo
-        go test ./core/schemas/...
-        if ($LASTEXITCODE -ne 0) { throw "Bifrost schema tests failed" }
+        gofmt -w $responsesGo $muxGo $cursorGo $schemaCompatTest $cursorCompatTest
+
+        Push-Location (Join-Path $SourceRoot "core")
+        try {
+            go test ./schemas -run CursorConnector -count=1
+            if ($LASTEXITCODE -ne 0) { throw "Bifrost schema compatibility tests failed" }
+        } finally {
+            Pop-Location
+        }
+
+        $goWork = Join-Path $SourceRoot "go.work"
+        $createdGoWork = -not (Test-Path $goWork)
+        if ($createdGoWork) {
+            go work init
+            go work use ./core ./framework ./plugins/compat ./plugins/governance ./plugins/jsonparser ./plugins/logging ./plugins/maxim ./plugins/mocker ./plugins/otel ./plugins/prompts ./plugins/semanticcache ./plugins/telemetry ./transports
+            if ($LASTEXITCODE -ne 0) { throw "Bifrost go.work setup failed" }
+        }
+        Push-Location (Join-Path $SourceRoot "transports")
+        try {
+            go test ./bifrost-http/integrations -run CursorConnector -count=1
+            if ($LASTEXITCODE -ne 0) { throw "Bifrost Cursor compatibility tests failed" }
+        } finally {
+            Pop-Location
+            if ($createdGoWork) {
+                Remove-Item -LiteralPath $goWork -Force
+                $goWorkSum = Join-Path $SourceRoot "go.work.sum"
+                if (Test-Path $goWorkSum) { Remove-Item -LiteralPath $goWorkSum -Force }
+            }
+        }
 
         $dockerfile = Join-Path $PSScriptRoot "Dockerfile.bifrost-patched"
         docker build -f $dockerfile -t $BifrostImage --build-arg VERSION=local-patch .
