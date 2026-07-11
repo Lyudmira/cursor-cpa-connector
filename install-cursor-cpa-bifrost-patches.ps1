@@ -308,9 +308,45 @@ case ResponsesToolTypeFunction:
     }
     Save-Utf8NoBom $responsesGo $content
 
+    $cursorGo = Join-Path $SourceRoot "transports\bifrost-http\integrations\cursor.go"
+    if (-not (Test-Path $cursorGo)) {
+        throw "Bifrost Cursor integration not found: $cursorGo"
+    }
+
+    $cursorContent = Get-Content -Raw -LiteralPath $cursorGo
+    if ($cursorContent -notmatch "normalizeCursorFunctionCallOutputs") {
+        $cursorContent = $cursorContent -replace 'cursorMergeToolResultsFromMessages\(data, cursorReq\)\r?\n\s*normalizeInputContentBlocks\(cursorReq\)', "cursorMergeToolResultsFromMessages(data, cursorReq)`r`n`t`tnormalizeCursorFunctionCallOutputs(cursorReq)`r`n`t`tnormalizeInputContentBlocks(cursorReq)"
+
+        $normalizeMarker = '// normalizeInputContentBlocks ensures all input messages have ContentBlocks instead of'
+        $normalizeFunction = @"
+// normalizeCursorFunctionCallOutputs rewrites Cursor's non-standard text aliases
+// to the input_text content type required for Responses API tool-result history.
+func normalizeCursorFunctionCallOutputs(req *openai.OpenAIResponsesRequest) {
+	for i := range req.Input.OpenAIResponsesRequestInputArray {
+		msg := &req.Input.OpenAIResponsesRequestInputArray[i]
+		if msg.Type == nil || *msg.Type != schemas.ResponsesMessageTypeFunctionCallOutput || msg.ResponsesToolMessage == nil || msg.Output == nil {
+			continue
+		}
+		for j := range msg.Output.ResponsesFunctionToolCallOutputBlocks {
+			block := &msg.Output.ResponsesFunctionToolCallOutputBlocks[j]
+			if block.Type == "text" || block.Type == schemas.ResponsesOutputMessageContentTypeText {
+				block.Type = schemas.ResponsesInputMessageContentBlockTypeText
+			}
+		}
+	}
+}
+
+"@
+        if (-not $cursorContent.Contains($normalizeMarker)) {
+            throw "Could not locate Cursor input normalization marker in $cursorGo"
+        }
+        $cursorContent = $cursorContent.Replace($normalizeMarker, $normalizeFunction + $normalizeMarker)
+        Save-Utf8NoBom $cursorGo $cursorContent
+    }
+
     Push-Location $SourceRoot
     try {
-        gofmt -w $responsesGo
+        gofmt -w $responsesGo $cursorGo
         go test ./core/schemas/...
         if ($LASTEXITCODE -ne 0) { throw "Bifrost schema tests failed" }
 

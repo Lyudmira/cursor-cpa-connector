@@ -67,6 +67,7 @@ Regex patch on `core/schemas/responses.go` (via the install script):
 
 - `ResponsesToolTypeFunction`: fallback to `raw["function"]` and `raw["input_schema"]`.
 - `Strict *bool` json tag gets `omitempty`.
+- Cursor `function_call_output.output[]` content aliases `text` / `output_text` are normalized to `input_text` before provider forwarding.
 
 ## Install mechanism
 
