@@ -139,9 +139,11 @@ HTTP error: 400 Bad Request
 wss://.../v1/responses
 ```
 
-the client is trying to use WebSockets. Point it at HTTP Responses instead by disabling WebSockets on that provider in Codex config (`~/.codex/config.toml` or equivalent):
+the client is trying to use WebSockets. Point it at HTTP Responses instead by disabling WebSockets on that provider in Codex config (`~/.codex/config.toml` or equivalent). Prefer a **custom** `[model_providers.xxx]` entry with `model_provider = "xxx"`; do not rely on `openai_base_url` alone, because that keeps the built-in `openai` provider (WebSocket-capable) and cannot pin `supports_websockets = false`:
 
 ```toml
+model_provider = "xxx"
+
 [model_providers.xxx]
 name = "xxx"
 base_url = "https://xxx/v1"
@@ -150,6 +152,18 @@ supports_websockets = false
 ```
 
 Replace `xxx` / `base_url` with your Bifrost (or edge) URL. With `supports_websockets = false`, Codex uses ordinary HTTP `POST /v1/responses`, which is what this kit patches for.
+
+### Codex UI can rewrite `~/.codex/config.toml`
+
+The Codex / ChatGPT VS Code extension may rewrite the whole user `config.toml` when it persists the composer default model (internal path: `set-default-model-config-for-host`, logged as `Setting default model and reasoning effort`). That writeback often keeps only fields the UI manages (`model`, `model_reasoning_effort`, `openai_base_url`, project trust, …) and **drops** hand-written `[model_providers.*]` blocks, including `supports_websockets = false`. Afterward you may see WebSocket `400` again, and older threads that still reference the removed provider id fail with `Model provider \`xxx\` not found`.
+
+There is no official lock for custom provider sections. After you finish editing `~/.codex/config.toml`, mark it read-only so the UI cannot overwrite it:
+
+```powershell
+attrib +R "$env:USERPROFILE\.codex\config.toml"
+```
+
+Clear the read-only bit before intentional edits (`attrib -R ...`), then set it again. Model changes on an empty composer may then fail with a config-update error; that is expected if the file is locked. Changing the model on an existing thread usually updates only that thread and does not rewrite the global file.
 
 ## Files
 
