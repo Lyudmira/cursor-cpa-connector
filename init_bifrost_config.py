@@ -293,8 +293,10 @@ def apply(db_path: Path, primary_url: str, primary_key: str, backup_url: str | N
         cpa_id = upsert_provider(conn, "cpa", cpa_url, allow_private=True)
         upsert_key(conn, "cpa", cpa_id, "cpa-key-1", cpa_key, CPA_MODELS)
 
+        cpa_set = set(CPA_MODELS)
         primary_id = upsert_provider(conn, "muskapi", primary_url)
-        upsert_key(conn, "muskapi", primary_id, "muskapi-key-1", primary_key, PRIMARY_MODELS)
+        primary_key_models = [model for model in PRIMARY_MODELS if model not in cpa_set]
+        upsert_key(conn, "muskapi", primary_id, "muskapi-key-1", primary_key, primary_key_models)
 
         if enable_backup:
             backup_id = upsert_provider(conn, "newapi", backup_url)  # type: ignore[arg-type]
@@ -302,7 +304,6 @@ def apply(db_path: Path, primary_url: str, primary_key: str, backup_url: str | N
 
         # Models served by logged-in CPA win the CEL route; remaining primary
         # models (Anthropic / extra GPT) go to muskapi.
-        cpa_set = set(CPA_MODELS)
         for model in PRIMARY_MODELS:
             if model in cpa_set:
                 continue
