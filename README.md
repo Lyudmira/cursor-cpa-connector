@@ -157,22 +157,18 @@ Replace `xxx` / `base_url` with your Bifrost (or edge) URL. With `supports_webso
 
 The Codex / ChatGPT VS Code extension may rewrite the whole user `config.toml` when it persists the composer default model (internal path: `set-default-model-config-for-host`, logged as `Setting default model and reasoning effort`). That writeback often keeps only fields the UI manages (`model`, `model_reasoning_effort`, `openai_base_url`, project trust, …) and **drops** hand-written `[model_providers.*]` blocks, including `supports_websockets = false`. Afterward you may see WebSocket `400` again, and older threads that still reference the removed provider id fail with `Model provider \`xxx\` not found`.
 
-Do **not** mark the whole `config.toml` read-only (`attrib +R`). That blocks the UI from changing the default model and is too coarse.
+Do **not** mark the whole `config.toml` read-only, and do **not** run a poll/watch loop on the file. Both are worse than the problem: read-only blocks model changes; a resident watcher is unnecessary complexity.
 
-Instead, pin only the provider trailer (leave `model` / effort editable). One-shot:
+**Simple fix:** put the provider pin in Codex's managed layer. On Windows that file is `~/.codex/managed_config.toml`. It merges **on top of** user `config.toml`, so the UI can keep rewriting model/effort in the user file while the HTTP-only provider survives:
 
 ```powershell
 cd C:\CLIProxyAPI\patches\cursor-cpa-connector
 .\pin-codex-lycorica-provider.ps1
+# optional: also strip openai_base_url / duplicate provider bits from user config.toml
+.\pin-codex-lycorica-provider.ps1 -AlsoCleanUserConfig
 ```
 
-Keep it pinned across UI writebacks (recommended while using Codex). `-Watch` uses `FileSystemWatcher` (blocks on OS file events; idle CPU near zero — not a poll loop):
-
-```powershell
-.\pin-codex-lycorica-provider.ps1 -Watch
-```
-
-The script strips a dropped/rewritten `openai_base_url` and re-appends a fixed trailer at the end of the file:
+That writes (only) this managed trailer:
 
 ```toml
 model_provider = "lycorica"
@@ -184,7 +180,7 @@ wire_api = "responses"
 supports_websockets = false
 ```
 
-UI-owned keys above that trailer stay free to change. Override provider id / URL with `-ProviderId` / `-BaseUrl` if your edge name differs.
+Restart Codex / reload the extension once after creating or changing `managed_config.toml`. Override `-ProviderId` / `-BaseUrl` if your edge name differs.
 
 ## Files
 
@@ -193,7 +189,7 @@ UI-owned keys above that trailer stay free to change. Override provider id / URL
 | `install-cursor-cpa-bifrost-patches.ps1` | Clone/patch/build CPA and Bifrost; optional `-InitConfig` |
 | `init-config.ps1` | Interactive (default) or `-UseEnv` upstream wiring into `config.db` / CPA `api-keys` |
 | `init_bifrost_config.py` | SQLite helper used by `init-config.ps1` |
-| `pin-codex-lycorica-provider.ps1` | Re-pin lycorica `supports_websockets = false` trailer after Codex UI config rewrite; optional event-driven `-Watch` |
+| `pin-codex-lycorica-provider.ps1` | Write lycorica `supports_websockets = false` into `~/.codex/managed_config.toml` (survives UI rewrites of `config.toml`) |
 | `.env.example` | Template for `-UseEnv` only |
 | `codex_openai_responses_request.go` | Full Responses **request** translator patch |
 | `codex_openai_response.go` | Chat-completions response patch (PR #4079) |
