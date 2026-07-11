@@ -2,8 +2,8 @@
 
 Cursor's Codex-mode client sends Responses API history and tool payloads in a shape that is looser than what upstream Codex and Bifrost's schema layer expect. Failure modes we patch for:
 
-1. **Input history** — Cursor attaches `role` to non-`message` items (`function_call`, `function_call_output`, …) and uses `output[].type: "text"` where Codex expects `input_text`.
-2. **Tool schemas through Bifrost** — nested `function.name` / `function.parameters` and flat `input_schema` get dropped; `strict: null` is emitted when Cursor omits `strict`.
+1. **Input history** - Cursor attaches `role` to non-`message` items (`function_call`, `function_call_output`, ...) and uses `output[].type: "text"` where Codex expects `input_text`.
+2. **Tool schemas through Bifrost** - nested `function.name` / `function.parameters` and flat `input_schema` get dropped; `strict: null` is emitted when Cursor omits `strict`.
 
 This kit patches CPA and Bifrost at the source level, rebuilds them locally, and can interactively wire Bifrost primary/backup upstreams.
 
@@ -24,10 +24,19 @@ cd C:\CLIProxyAPI\patches\cursor-cpa-connector
 
 The prompts explain why there are two upstreams:
 
-1. **Primary** — normal GPT + Anthropic traffic (you must enter Base URL unless you also pass `-DefaultEndpoint`, which allows Enter to use `https://api.muskapi.cc/v1`)
-2. **Backup** (optional) — models the primary does not offer, and failover if primary fails. **Press Enter on the backup Base URL to skip** if you do not have a backup.
+1. **Primary** - normal GPT + Anthropic traffic (you must enter Base URL unless you also pass `-DefaultEndpoint`, which allows Enter to use `https://api.muskapi.cc/v1`)
+2. **Backup** (optional) - models the primary does not offer, and failover if primary fails. **Press Enter on the backup Base URL to skip** if you do not have a backup.
 
 Suggested backup URL if you want one: `https://ai.centos.hk/v1` (paste it; Enter alone still means skip).
+
+### Routing model lists
+
+`init_bifrost_config.py` has two intentionally different model lists:
+
+- `PRIMARY_MODELS` are routed to the primary OpenAI-compatible upstream (`muskapi` by default), with optional backup fallback when backup is configured.
+- `CPA_MODELS` are routed directly to CPA/OAuth. They do **not** fall back to the primary or backup upstream after CPA capacity, quota, or account availability is exhausted; CPA will return an error instead.
+
+Use `CPA_MODELS` for models where downstream fallback is known to behave incorrectly, has unacceptable performance, or may cause unexpected billing. Users should review this tradeoff and configure their own routing and fallback policy for their provider/account mix.
 
 You can run config alone:
 
@@ -38,17 +47,17 @@ You can run config alone:
 
 ## What each patch does
 
-### CPA — Responses request (`codex_openai_responses_request.go`)
+### CPA - Responses request (`codex_openai_responses_request.go`)
 
 Copied wholesale into `internal/translator/codex/openai/responses/codex_openai-responses_request.go`.
 
-- `sanitizeCodexResponsesInputItems` — `system` → `developer` on messages; strip `role` from non-message items; `text`/`output_text` → `input_text` on `function_call_output`.
-- `removeUnsupportedCursorCustomToolsForCodexBYOK` — drop Cursor `ApplyPatch` custom tool on BYOK routes.
-- `addCodexBYOKToolCompatibilityInstruction` — optional instruction when Shell is present without ApplyPatch.
-- `normalizeCodexBuiltinTools` — e.g. `web_search_preview` → `web_search`.
-- `applyResponsesCompactionCompatibility` — Codex `/responses` compaction compatibility.
+- `sanitizeCodexResponsesInputItems` - `system` -> `developer` on messages; strip `role` from non-message items; `text`/`output_text` -> `input_text` on `function_call_output`.
+- `removeUnsupportedCursorCustomToolsForCodexBYOK` - drop Cursor `ApplyPatch` custom tool on BYOK routes.
+- `addCodexBYOKToolCompatibilityInstruction` - optional instruction when Shell is present without ApplyPatch.
+- `normalizeCodexBuiltinTools` - e.g. `web_search_preview` -> `web_search`.
+- `applyResponsesCompactionCompatibility` - Codex `/responses` compaction compatibility.
 
-### CPA — Chat-completions response (`codex_openai_response.go`)
+### CPA - Chat-completions response (`codex_openai_response.go`)
 
 Dropped in wholesale from CLIProxyAPI PR #4079 into `internal/translator/codex/openai/chat-completions/codex_openai_response.go`. Adds `custom_tool_call` handling on the chat-completions translation path.
 
@@ -81,8 +90,8 @@ Only if you explicitly opt in. Copy `.env.example` to `.env`, then:
 
 Semantics:
 
-- Missing `PRIMARY_BASE_URL` / `BACKUP_BASE_URL` fields → built-in defaults (`muskapi` / `ai.centos.hk`)
-- Empty or omitted `BACKUP_API_KEY` → **skip backup**
+- Missing `PRIMARY_BASE_URL` / `BACKUP_BASE_URL` fields -> built-in defaults (`muskapi` / `ai.centos.hk`)
+- Empty or omitted `BACKUP_API_KEY` -> **skip backup**
 - `PRIMARY_API_KEY` is required for `-UseEnv`
 
 ## Verifying the fix
@@ -114,14 +123,14 @@ Expect HTTP 200. Before the patch, Codex rejects `input[n].role` or `output[].ty
 
 ## Troubleshooting: Codex WebSocket to `/v1/responses`
 
-This kit’s CPA Responses patch fixes **HTTP** request-body compatibility (roles, `input_text`, tools, compaction). It does **not** implement Codex’s WebSocket Responses transport.
+This kit's CPA Responses patch fixes **HTTP** request-body compatibility (roles, `input_text`, tools, compaction). It does **not** implement Codex's WebSocket Responses transport.
 
 If Codex (or a Codex-shaped client) errors while opening a WebSocket against your Bifrost/CPA endpoint, for example:
 
 ```text
 failed to connect to websocket:
 HTTP error: 400 Bad Request
-wss://…/v1/responses
+wss://.../v1/responses
 ```
 
 the client is trying to use WebSockets. Point it at HTTP Responses instead by disabling WebSockets on that provider in Codex config (`~/.codex/config.toml` or equivalent):
@@ -153,5 +162,5 @@ Replace `xxx` / `base_url` with your Bifrost (or edge) URL. With `supports_webso
 
 - Without a backup upstream, models that only exist on the backup (for example spark-preview via centos) will not be routed.
 - If `config.db` has no schema yet, start Bifrost once, then re-run `init-config.ps1`.
-- Bifrost `main` moves faster than CPA tags — regex failures mean the kit needs a manual refresh.
+- Bifrost `main` moves faster than CPA tags - regex failures mean the kit needs a manual refresh.
 - Full-file CPA patches can diverge from upstream if CLIProxyAPI refactors the Responses translators; merge carefully on version bumps.
