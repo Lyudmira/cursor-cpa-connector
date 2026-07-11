@@ -157,13 +157,34 @@ Replace `xxx` / `base_url` with your Bifrost (or edge) URL. With `supports_webso
 
 The Codex / ChatGPT VS Code extension may rewrite the whole user `config.toml` when it persists the composer default model (internal path: `set-default-model-config-for-host`, logged as `Setting default model and reasoning effort`). That writeback often keeps only fields the UI manages (`model`, `model_reasoning_effort`, `openai_base_url`, project trust, …) and **drops** hand-written `[model_providers.*]` blocks, including `supports_websockets = false`. Afterward you may see WebSocket `400` again, and older threads that still reference the removed provider id fail with `Model provider \`xxx\` not found`.
 
-There is no official lock for custom provider sections. After you finish editing `~/.codex/config.toml`, mark it read-only so the UI cannot overwrite it:
+Do **not** mark the whole `config.toml` read-only (`attrib +R`). That blocks the UI from changing the default model and is too coarse.
+
+Instead, pin only the provider trailer (leave `model` / effort editable). One-shot:
 
 ```powershell
-attrib +R "$env:USERPROFILE\.codex\config.toml"
+cd C:\CLIProxyAPI\patches\cursor-cpa-connector
+.\pin-codex-lycorica-provider.ps1
 ```
 
-Clear the read-only bit before intentional edits (`attrib -R ...`), then set it again. Model changes on an empty composer may then fail with a config-update error; that is expected if the file is locked. Changing the model on an existing thread usually updates only that thread and does not rewrite the global file.
+Keep it pinned across UI writebacks (recommended while using Codex):
+
+```powershell
+.\pin-codex-lycorica-provider.ps1 -Watch
+```
+
+The script strips a dropped/rewritten `openai_base_url` and re-appends a fixed trailer at the end of the file:
+
+```toml
+model_provider = "lycorica"
+
+[model_providers.lycorica]
+name = "lycorica"
+base_url = "https://cursor.lycorica.com/cursor/v1"
+wire_api = "responses"
+supports_websockets = false
+```
+
+UI-owned keys above that trailer stay free to change. Override provider id / URL with `-ProviderId` / `-BaseUrl` if your edge name differs.
 
 ## Files
 
@@ -172,6 +193,7 @@ Clear the read-only bit before intentional edits (`attrib -R ...`), then set it 
 | `install-cursor-cpa-bifrost-patches.ps1` | Clone/patch/build CPA and Bifrost; optional `-InitConfig` |
 | `init-config.ps1` | Interactive (default) or `-UseEnv` upstream wiring into `config.db` / CPA `api-keys` |
 | `init_bifrost_config.py` | SQLite helper used by `init-config.ps1` |
+| `pin-codex-lycorica-provider.ps1` | Re-pin lycorica `supports_websockets = false` trailer after Codex UI config rewrite; optional `-Watch` |
 | `.env.example` | Template for `-UseEnv` only |
 | `codex_openai_responses_request.go` | Full Responses **request** translator patch |
 | `codex_openai_response.go` | Chat-completions response patch (PR #4079) |
