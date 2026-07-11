@@ -1,0 +1,6 @@
+*.exe
+*.log
+config.yaml
+.env
+.env.*
+!.env.example

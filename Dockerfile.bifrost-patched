@@ -1,0 +1,36 @@
+# Patched Bifrost build for Cursor -> Bifrost -> CPA tool/Responses compatibility.
+FROM node:25-alpine3.23 AS ui-builder
+WORKDIR /app
+RUN apk upgrade --no-cache
+COPY ui/package*.json ./
+RUN npm ci
+COPY ui/ ./
+RUN npx vite build
+
+FROM golang:1.26.4-alpine3.23 AS builder
+WORKDIR /build
+RUN apk upgrade --no-cache && apk add --no-cache gcc musl-dev sqlite-dev binutils binutils-gold
+ENV CGO_ENABLED=1 GOOS=linux
+COPY core/ ./core/
+COPY framework/ ./framework/
+COPY plugins/ ./plugins/
+COPY transports/ ./transports/
+RUN go work init && go work use ./core && go work use ./framework && go work use ./plugins/compat && go work use ./plugins/governance && go work use ./plugins/jsonparser && go work use ./plugins/logging && go work use ./plugins/maxim && go work use ./plugins/mocker && go work use ./plugins/otel && go work use ./plugins/prompts && go work use ./plugins/semanticcache && go work use ./plugins/telemetry && go work use ./transports
+COPY --from=ui-builder /app/out ./transports/bifrost-http/ui
+ARG VERSION=local-patch
+RUN cd /build/transports && go build -ldflags="-w -s -X main.Version=v${VERSION} -extldflags '-static'" -a -trimpath -tags "sqlite_static" -o /app/main ./bifrost-http
+RUN test -f /app/main
+
+FROM alpine:3.23.4
+WORKDIR /app
+RUN apk upgrade --no-cache && apk add --no-cache musl libgcc ca-certificates zlib
+COPY --from=builder /app/main .
+COPY --from=builder /build/transports/docker-entrypoint.sh .
+ENV APP_PORT=8080 APP_HOST=0.0.0.0 LOG_LEVEL=info LOG_STYLE=json APP_DIR=/app/data
+RUN mkdir -p "$APP_DIR/logs" && adduser -D -s /bin/sh appuser && chown -R appuser:appuser /app && chmod +x /app/docker-entrypoint.sh
+USER appuser
+VOLUME ["/app/data"]
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 CMD wget -q -O /dev/null http://127.0.0.1:${APP_PORT}/health || exit 1
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
+CMD ["/app/main"]
