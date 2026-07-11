@@ -82,10 +82,11 @@ PATH_OVERRIDES = {
 }
 
 PRIMARY_MODELS = [
-    "claude-sonnet-5",
-    "claude-fable-5",
-    "claude-opus-4-8",
-    "claude-opus-4-6",
+    # Claude models are intentionally NOT listed here -- they are routed via a single
+    # wildcard rule (ANTHROPIC_MODEL_CEL below) to the "muskapi-anthropic" provider
+    # (native Anthropic Messages endpoint), not to "muskapi" (OpenAI-compatible). Prompt
+    # caching does not work at all through the OpenAI-compatible surface; see
+    # log/major_fix/ for the full investigation.
     "gpt-5.4-mini",
     "gpt-5.4",
     "gpt-5.5",
@@ -93,6 +94,13 @@ PRIMARY_MODELS = [
     "gpt-5.6-sol",
     "gpt-5.6-terra",
 ]
+
+# Any Claude model (current or future) reaching the primary upstream is routed natively
+# instead of through the OpenAI-compatible surface. routing_targets.model is left NULL
+# for this rule (see upsert_route), so the client-requested model name (e.g.
+# "claude-opus-4-9" the day it ships) passes straight through -- no need to enumerate
+# every Claude model by name here.
+ANTHROPIC_MODEL_CEL = "model.startsWith('claude-')"
 
 BACKUP_MODELS = [
     "gpt-5.3-codex-spark",
@@ -134,6 +142,34 @@ def custom_provider_json() -> str:
     )
 
 
+# base_provider_type "anthropic" for the native Anthropic Messages endpoint (muskapi
+# also exposes this alongside its OpenAI-compatible surface, at the same host with no
+# /v1 suffix and the same key). No request_path_overrides: Bifrost's built-in Anthropic
+# provider already hardcodes /v1/messages for chat_completion/responses (streaming and
+# non-streaming). Routing Claude models through this provider instead of the "muskapi"
+# OpenAI-compatible one is required for prompt caching to work at all -- see
+# log/major_fix/ for the full writeup of why.
+ANTHROPIC_ALLOWED_REQUESTS = {
+    **{k: False for k in ALLOWED_REQUESTS},
+    "list_models": True,
+    "chat_completion": True,
+    "chat_completion_stream": True,
+    "responses": True,
+    "responses_stream": True,
+}
+
+
+def anthropic_custom_provider_json() -> str:
+    return json.dumps(
+        {
+            "is_key_less": False,
+            "base_provider_type": "anthropic",
+            "allowed_requests": ANTHROPIC_ALLOWED_REQUESTS,
+        },
+        separators=(",", ":"),
+    )
+
+
 def network_json(base_url: str, timeout: int = 120, max_retries: int = 1, allow_private: bool = False) -> str:
     cfg = {
         "base_url": base_url.rstrip("/"),
@@ -147,10 +183,10 @@ def network_json(base_url: str, timeout: int = 120, max_retries: int = 1, allow_
     return json.dumps(cfg, separators=(",", ":"))
 
 
-def upsert_provider(conn: sqlite3.Connection, name: str, base_url: str, allow_private: bool = False) -> int:
+def upsert_provider(conn: sqlite3.Connection, name: str, base_url: str, allow_private: bool = False, base_provider_type: str = "openai") -> int:
     row = conn.execute("SELECT id FROM config_providers WHERE name = ?", (name,)).fetchone()
     net = network_json(base_url, allow_private=allow_private)
-    custom = custom_provider_json()
+    custom = anthropic_custom_provider_json() if base_provider_type == "anthropic" else custom_provider_json()
     now = utc_now()
     if row:
         conn.execute(
@@ -213,10 +249,14 @@ def upsert_route(
     cel: str,
     description: str,
     provider: str,
-    model: str,
+    model: str | None,
     fallbacks: list[str],
     priority: int = 2,
 ) -> None:
+    # model=None routes with target model left NULL, which Bifrost's router resolves as
+    # "pass the client-requested model straight through unchanged" -- required for a
+    # wildcard CEL rule (e.g. matching any "claude-*" model) to forward each model's own
+    # name rather than pinning every match to one literal model string.
     now = utc_now()
     fallbacks_json = json.dumps(fallbacks, separators=(",", ":"))
     row = conn.execute(
@@ -258,6 +298,7 @@ def apply(db_path: Path, primary_url: str, primary_key: str, backup_url: str | N
     actions = [
         f"provider cpa -> {cpa_url}",
         f"provider muskapi (primary) -> {primary_url}",
+        "provider muskapi-anthropic (native, any claude-* model) -> muskapi host without /v1",
     ]
     if enable_backup:
         actions.append(f"provider newapi (backup) -> {backup_url}")
@@ -297,6 +338,27 @@ def apply(db_path: Path, primary_url: str, primary_key: str, backup_url: str | N
         primary_id = upsert_provider(conn, "muskapi", primary_url)
         primary_key_models = [model for model in PRIMARY_MODELS if model not in cpa_set]
         upsert_key(conn, "muskapi", primary_id, "muskapi-key-1", primary_key, primary_key_models)
+
+        # Native Anthropic Messages endpoint for Claude models -- same host as
+        # `primary_url` but without the "/v1" OpenAI-compatible suffix, same key (the
+        # native endpoint accepts x-api-key with a plain API key; confirmed against
+        # muskapi directly). "*" allowlist: Bifrost denies-by-default on an empty models
+        # list, so this must be explicit, not just omitted.
+        anthropic_url = primary_url.rstrip("/")
+        if anthropic_url.endswith("/v1"):
+            anthropic_url = anthropic_url[: -len("/v1")]
+        anthropic_id = upsert_provider(conn, "muskapi-anthropic", anthropic_url, base_provider_type="anthropic")
+        upsert_key(conn, "muskapi-anthropic", anthropic_id, "muskapi-anthropic-key-1", primary_key, ["*"])
+        upsert_route(
+            conn,
+            name="any claude-* model -> anthropic native",
+            cel=ANTHROPIC_MODEL_CEL,
+            description="native Anthropic provider via muskapi, any Claude model",
+            provider="muskapi-anthropic",
+            model=None,
+            fallbacks=[],
+            priority=10,
+        )
 
         if enable_backup:
             backup_id = upsert_provider(conn, "newapi", backup_url)  # type: ignore[arg-type]

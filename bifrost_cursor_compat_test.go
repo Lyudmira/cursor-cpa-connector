@@ -1,39 +1,252 @@
 package integrations
 
 import (
-    "testing"
-    "github.com/maximhq/bifrost/core/providers/openai"
-    "github.com/maximhq/bifrost/core/schemas"
+	"github.com/maximhq/bifrost/core/providers/openai"
+	"github.com/maximhq/bifrost/core/schemas"
+	"testing"
 )
 
 func cursorConnectorTool(name string) schemas.ResponsesTool {
-    return schemas.ResponsesTool{Type: schemas.ResponsesToolTypeFunction, Name: &name, ResponsesToolFunction: &schemas.ResponsesToolFunction{}}
+	return schemas.ResponsesTool{Type: schemas.ResponsesToolTypeFunction, Name: &name, ResponsesToolFunction: &schemas.ResponsesToolFunction{}}
 }
 
+func cursorConnectorSystemMessage(text string) schemas.ResponsesMessage {
+	role := schemas.ResponsesInputMessageRoleSystem
+	return schemas.ResponsesMessage{
+		Role: &role,
+		Content: &schemas.ResponsesMessageContent{
+			ContentBlocks: []schemas.ResponsesMessageContentBlock{
+				{Type: schemas.ResponsesInputMessageContentBlockTypeText, Text: &text},
+			},
+		},
+	}
+}
+
+func cursorConnectorMsg(r schemas.ResponsesMessageRoleType, text string) schemas.ResponsesMessage {
+	t := text
+	return schemas.ResponsesMessage{Role: &r, Content: &schemas.ResponsesMessageContent{ContentBlocks: []schemas.ResponsesMessageContentBlock{{Type: schemas.ResponsesInputMessageContentBlockTypeText, Text: &t}}}}
+}
+
+func cursorConnectorCacheControl(msg schemas.ResponsesMessage) *schemas.CacheControl {
+	if msg.Content == nil || len(msg.Content.ContentBlocks) == 0 {
+		return nil
+	}
+	return msg.Content.ContentBlocks[len(msg.Content.ContentBlocks)-1].CacheControl
+}
+
+// TestCursorConnectorClaudeToolCacheBreakpoint covers model gating and explicit-override
+// suppression. It does NOT mark tools directly (confirmed empirically that a message-level
+// breakpoint alone already covers the tools in Anthropic's fixed content ordering — see
+// addCursorClaudeToolCacheBreakpoint's doc comment); it delegates all marking to
+// addCursorClaudeSystemCacheBreakpoint, tested separately below.
 func TestCursorConnectorClaudeToolCacheBreakpoint(t *testing.T) {
-    req := &openai.OpenAIResponsesRequest{Model: "claude-sonnet-5"}
-    req.Tools = []schemas.ResponsesTool{cursorConnectorTool("ReadFile"), cursorConnectorTool("Shell")}
-    addCursorClaudeToolCacheBreakpoint(req)
-    if req.Tools[0].CacheControl != nil || req.Tools[1].CacheControl == nil || req.Tools[1].CacheControl.Type != schemas.CacheControlTypeEphemeral { t.Fatalf("wrong breakpoint: %#v", req.Tools) }
+	req := &openai.OpenAIResponsesRequest{Model: "claude-sonnet-5"}
+	req.Tools = []schemas.ResponsesTool{cursorConnectorTool("ReadFile"), cursorConnectorTool("Shell")}
+	req.Input.OpenAIResponsesRequestInputArray = []schemas.ResponsesMessage{cursorConnectorMsg(schemas.ResponsesInputMessageRoleUser, "hi")}
+	addCursorClaudeToolCacheBreakpoint(req)
+	if req.Tools[0].CacheControl != nil || req.Tools[1].CacheControl != nil {
+		t.Fatalf("tools should never be marked directly: %#v", req.Tools)
+	}
+	if cursorConnectorCacheControl(req.Input.OpenAIResponsesRequestInputArray[0]) == nil {
+		t.Fatal("the message-level breakpoint should still be applied for a Claude request")
+	}
 
-    explicit := &openai.OpenAIResponsesRequest{Model: "claude-sonnet-5"}
-    explicit.Tools = []schemas.ResponsesTool{cursorConnectorTool("ReadFile"), cursorConnectorTool("Shell")}
-    explicit.Tools[0].CacheControl = &schemas.CacheControl{Type: schemas.CacheControlTypeEphemeral}
-    addCursorClaudeToolCacheBreakpoint(explicit)
-    if explicit.Tools[1].CacheControl != nil { t.Fatal("explicit cache_control was supplemented") }
+	// An explicit client-supplied cache_control (tool or message) suppresses
+	// auto-injection entirely.
+	explicitTool := &openai.OpenAIResponsesRequest{Model: "claude-sonnet-5"}
+	explicitTool.Tools = []schemas.ResponsesTool{cursorConnectorTool("Shell")}
+	explicitTool.Tools[0].CacheControl = &schemas.CacheControl{Type: schemas.CacheControlTypeEphemeral}
+	explicitTool.Input.OpenAIResponsesRequestInputArray = []schemas.ResponsesMessage{cursorConnectorMsg(schemas.ResponsesInputMessageRoleUser, "hi")}
+	addCursorClaudeToolCacheBreakpoint(explicitTool)
+	if cursorConnectorCacheControl(explicitTool.Input.OpenAIResponsesRequestInputArray[0]) != nil {
+		t.Fatal("explicit tool cache_control should suppress message-level auto-injection too")
+	}
 
-    other := &openai.OpenAIResponsesRequest{Model: "gpt-5.6-sol"}
-    other.Tools = []schemas.ResponsesTool{cursorConnectorTool("Shell")}
-    addCursorClaudeToolCacheBreakpoint(other)
-    if other.Tools[0].CacheControl != nil { t.Fatal("non-Claude request modified") }
+	other := &openai.OpenAIResponsesRequest{Model: "gpt-5.6-sol"}
+	other.Input.OpenAIResponsesRequestInputArray = []schemas.ResponsesMessage{cursorConnectorMsg(schemas.ResponsesInputMessageRoleUser, "hi")}
+	addCursorClaudeToolCacheBreakpoint(other)
+	if cursorConnectorCacheControl(other.Input.OpenAIResponsesRequestInputArray[0]) != nil {
+		t.Fatal("non-Claude request modified")
+	}
+
+	// Bifrost addresses upstream models as "provider/model" (e.g. how this kit's own
+	// init script registers Claude models: "muskapi/claude-sonnet-5"). Cursor's
+	// configured custom model name is frequently this provider-prefixed form, not the
+	// bare model name, and must still be recognized as Claude.
+	prefixed := &openai.OpenAIResponsesRequest{Model: "muskapi/claude-sonnet-5"}
+	prefixed.Input.OpenAIResponsesRequestInputArray = []schemas.ResponsesMessage{cursorConnectorMsg(schemas.ResponsesInputMessageRoleUser, "hi")}
+	addCursorClaudeToolCacheBreakpoint(prefixed)
+	if cursorConnectorCacheControl(prefixed.Input.OpenAIResponsesRequestInputArray[0]) == nil {
+		t.Fatal("provider-prefixed Claude model (muskapi/claude-sonnet-5) was not recognized")
+	}
+
+	prefixedOther := &openai.OpenAIResponsesRequest{Model: "muskapi/gpt-5.6-sol"}
+	prefixedOther.Input.OpenAIResponsesRequestInputArray = []schemas.ResponsesMessage{cursorConnectorMsg(schemas.ResponsesInputMessageRoleUser, "hi")}
+	addCursorClaudeToolCacheBreakpoint(prefixedOther)
+	if cursorConnectorCacheControl(prefixedOther.Input.OpenAIResponsesRequestInputArray[0]) != nil {
+		t.Fatal("provider-prefixed non-Claude request modified")
+	}
+}
+
+// TestCursorConnectorClaudeSystemCacheBreakpoint covers the 4-breakpoint scheme: stable
+// anchor (system/developer message, or the first message when there is none), the
+// absolute last two messages (covers a Cursor tool-calling loop growing WITHIN a single
+// turn), and the second-to-last user-role message (covers realignment ACROSS a full turn
+// boundary, which typically appends more than one message at once).
+func TestCursorConnectorClaudeSystemCacheBreakpoint(t *testing.T) {
+	req := &openai.OpenAIResponsesRequest{Model: "claude-opus-4-8"}
+	req.Input.OpenAIResponsesRequestInputArray = []schemas.ResponsesMessage{
+		cursorConnectorSystemMessage("You are a helpful assistant."),
+	}
+	addCursorClaudeToolCacheBreakpoint(req)
+
+	sysBlocks := req.Input.OpenAIResponsesRequestInputArray[0].Content.ContentBlocks
+	if len(sysBlocks) != 1 || sysBlocks[0].CacheControl == nil || sysBlocks[0].CacheControl.Type != schemas.CacheControlTypeEphemeral {
+		t.Fatalf("expected ephemeral breakpoint on last system content block: %#v", sysBlocks)
+	}
+
+	// A client-supplied cache_control on a message content block must suppress
+	// auto-injection.
+	explicit := &openai.OpenAIResponsesRequest{Model: "claude-opus-4-8"}
+	explicit.Input.OpenAIResponsesRequestInputArray = []schemas.ResponsesMessage{
+		cursorConnectorSystemMessage("You are a helpful assistant."),
+	}
+	explicit.Input.OpenAIResponsesRequestInputArray[0].Content.ContentBlocks[0].CacheControl = &schemas.CacheControl{Type: schemas.CacheControlTypeEphemeral}
+	before := explicit.Input.OpenAIResponsesRequestInputArray[0].Content.ContentBlocks[0].CacheControl
+	addCursorClaudeToolCacheBreakpoint(explicit)
+	if explicit.Input.OpenAIResponsesRequestInputArray[0].Content.ContentBlocks[0].CacheControl != before {
+		t.Fatal("explicit content-block cache_control should not be replaced")
+	}
+
+	// No tools at all: the stable-anchor breakpoint must still be applied.
+	noTools := &openai.OpenAIResponsesRequest{Model: "claude-sonnet-5"}
+	noTools.Input.OpenAIResponsesRequestInputArray = []schemas.ResponsesMessage{
+		cursorConnectorSystemMessage("System prompt only, no tools."),
+	}
+	addCursorClaudeToolCacheBreakpoint(noTools)
+	if cb := noTools.Input.OpenAIResponsesRequestInputArray[0].Content.ContentBlocks[0].CacheControl; cb == nil {
+		t.Fatal("stable-anchor breakpoint should be applied even when there are no tools")
+	}
+
+	// No system/developer message: Cursor's real production traffic doesn't send one at
+	// all — all context (including what would normally be a system prompt) is folded into
+	// the first message, which is role=user. Must not panic; the first message must get
+	// the fallback stable-anchor breakpoint.
+	noSystem := &openai.OpenAIResponsesRequest{Model: "claude-sonnet-5"}
+	noSystem.Input.OpenAIResponsesRequestInputArray = []schemas.ResponsesMessage{
+		cursorConnectorMsg(schemas.ResponsesInputMessageRoleUser, "hello"),
+	}
+	addCursorClaudeToolCacheBreakpoint(noSystem)
+	if cb := noSystem.Input.OpenAIResponsesRequestInputArray[0].Content.ContentBlocks[0].CacheControl; cb == nil || cb.Type != schemas.CacheControlTypeEphemeral {
+		t.Fatal("first message should get a fallback breakpoint when there is no system/developer message")
+	}
+
+	// --- Turn boundary realignment (2 items appended per turn: assistant + user) ---
+	//
+	// Turn 2 shape: [user0, assistant1, user2].
+	turn2 := &openai.OpenAIResponsesRequest{Model: "claude-sonnet-5"}
+	turn2.Input.OpenAIResponsesRequestInputArray = []schemas.ResponsesMessage{
+		cursorConnectorMsg(schemas.ResponsesInputMessageRoleUser, "stable first message"),
+		cursorConnectorMsg(schemas.ResponsesInputMessageRoleAssistant, "assistant reply 1"),
+		cursorConnectorMsg(schemas.ResponsesInputMessageRoleUser, "user turn 2"),
+	}
+	addCursorClaudeSystemCacheBreakpoint(turn2)
+	if cb := turn2.Input.OpenAIResponsesRequestInputArray[2].Content.ContentBlocks[0].CacheControl; cb == nil {
+		t.Fatal("turn2's latest message (absolute last) must carry a breakpoint")
+	}
+
+	// Turn 3 shape: [user0, assistant1, user2, assistant3, user4] — 2 more messages
+	// appended since turn 2, same as production Cursor traffic. Turn 2's own "absolute
+	// last" breakpoint was on user2 (index 2); by turn 3 that position is neither the
+	// absolute last (index 4) nor the absolute second-to-last (index 3) by raw index —
+	// it must be found via the second-to-last-*user*-message breakpoint instead.
+	turn3 := &openai.OpenAIResponsesRequest{Model: "claude-sonnet-5"}
+	turn3.Input.OpenAIResponsesRequestInputArray = []schemas.ResponsesMessage{
+		cursorConnectorMsg(schemas.ResponsesInputMessageRoleUser, "stable first message"),
+		cursorConnectorMsg(schemas.ResponsesInputMessageRoleAssistant, "assistant reply 1"),
+		cursorConnectorMsg(schemas.ResponsesInputMessageRoleUser, "user turn 2"),
+		cursorConnectorMsg(schemas.ResponsesInputMessageRoleAssistant, "assistant reply 2"),
+		cursorConnectorMsg(schemas.ResponsesInputMessageRoleUser, "user turn 3"),
+	}
+	addCursorClaudeSystemCacheBreakpoint(turn3)
+	if cb := turn3.Input.OpenAIResponsesRequestInputArray[2].Content.ContentBlocks[0].CacheControl; cb == nil {
+		t.Fatal("turn3 must still mark user2 (turn2's absolute-last position) so the read from turn2's write hits")
+	}
+	if cb := turn3.Input.OpenAIResponsesRequestInputArray[4].Content.ContentBlocks[0].CacheControl; cb == nil {
+		t.Fatal("turn3's own absolute-last message must also carry a breakpoint")
+	}
+	if cb := turn3.Input.OpenAIResponsesRequestInputArray[1].Content.ContentBlocks[0].CacheControl; cb != nil {
+		t.Fatal("assistant message 1 should not get a breakpoint")
+	}
+
+	// --- Within-turn tool-loop growth (1 item appended per API call) ---
+	//
+	// Simulate the sequence of API calls a Cursor tool-calling loop actually produces:
+	// each call in the loop appends exactly one new item versus the previous call. The
+	// invariant that must hold for every consecutive pair is: call N's "absolute last"
+	// breakpoint position must equal call N+1's "absolute second-to-last" position, so
+	// call N+1 can read what call N wrote moments earlier.
+	base := []schemas.ResponsesMessage{
+		cursorConnectorMsg(schemas.ResponsesInputMessageRoleUser, "stable first message"),
+		cursorConnectorMsg(schemas.ResponsesInputMessageRoleAssistant, "assistant reply 1"),
+		cursorConnectorMsg(schemas.ResponsesInputMessageRoleUser, "user turn 2 starts a tool loop"),
+	}
+	extra := []schemas.ResponsesMessage{
+		cursorConnectorMsg(schemas.ResponsesInputMessageRoleAssistant, "tool call 1"),
+		cursorConnectorMsg(schemas.ResponsesInputMessageRoleAssistant, "tool result 1"),
+		cursorConnectorMsg(schemas.ResponsesInputMessageRoleAssistant, "tool call 2"),
+		cursorConnectorMsg(schemas.ResponsesInputMessageRoleAssistant, "tool result 2"),
+	}
+	var prevLastIdx = -1
+	for step := 0; step <= len(extra); step++ {
+		call := &openai.OpenAIResponsesRequest{Model: "claude-sonnet-5"}
+		call.Input.OpenAIResponsesRequestInputArray = append(append([]schemas.ResponsesMessage{}, base...), extra[:step]...)
+		addCursorClaudeSystemCacheBreakpoint(call)
+		n := len(call.Input.OpenAIResponsesRequestInputArray)
+		lastIdx := n - 1
+		if step > 0 {
+			// The previous call's absolute-last position must be marked in THIS call —
+			// either because it's now the absolute second-to-last (n-2), which is always
+			// true here since exactly one item was appended, confirming the invariant.
+			if lastIdx-1 != prevLastIdx {
+				t.Fatalf("step %d: expected previous last index %d to be this call's second-to-last (%d)", step, prevLastIdx, lastIdx-1)
+			}
+			if cb := cursorConnectorCacheControl(call.Input.OpenAIResponsesRequestInputArray[prevLastIdx]); cb == nil {
+				t.Fatalf("step %d: previous call's absolute-last message (index %d) must still be marked so its cache write is read", step, prevLastIdx)
+			}
+		}
+		if cb := cursorConnectorCacheControl(call.Input.OpenAIResponsesRequestInputArray[lastIdx]); cb == nil {
+			t.Fatalf("step %d: this call's absolute-last message (index %d) must be marked", step, lastIdx)
+		}
+		prevLastIdx = lastIdx
+	}
+
+	// function_call/function_call_output items carry cache_control on the message
+	// itself, not on a content block — the sliding breakpoint must use the right slot
+	// when the latest item in the conversation is a tool result.
+	fcoType := schemas.ResponsesMessageTypeFunctionCallOutput
+	toolResult := &openai.OpenAIResponsesRequest{Model: "claude-sonnet-5"}
+	toolResult.Input.OpenAIResponsesRequestInputArray = []schemas.ResponsesMessage{
+		cursorConnectorMsg(schemas.ResponsesInputMessageRoleUser, "stable first message"),
+		{Type: &fcoType, ResponsesToolMessage: &schemas.ResponsesToolMessage{Output: &schemas.ResponsesToolMessageOutputStruct{ResponsesFunctionToolCallOutputBlocks: []schemas.ResponsesMessageContentBlock{{Type: schemas.ResponsesInputMessageContentBlockTypeText}}}}},
+	}
+	addCursorClaudeSystemCacheBreakpoint(toolResult)
+	if cb := toolResult.Input.OpenAIResponsesRequestInputArray[1].CacheControl; cb == nil {
+		t.Fatal("absolute-last breakpoint on a function_call_output item should be message-level, not content-block-level")
+	}
+	if cb := toolResult.Input.OpenAIResponsesRequestInputArray[0].Content.ContentBlocks[0].CacheControl; cb == nil {
+		t.Fatal("the stable-anchor breakpoint on the first message should still be applied")
+	}
 }
 
 func TestCursorConnectorNormalizesToolOutputs(t *testing.T) {
-    itemType := schemas.ResponsesMessageTypeFunctionCallOutput
-    for _, alias := range []schemas.ResponsesMessageContentBlockType{"text", schemas.ResponsesOutputMessageContentTypeText} {
-        req := &openai.OpenAIResponsesRequest{}
-        req.Input.OpenAIResponsesRequestInputArray = []schemas.ResponsesMessage{{Type: &itemType, ResponsesToolMessage: &schemas.ResponsesToolMessage{Output: &schemas.ResponsesToolMessageOutputStruct{ResponsesFunctionToolCallOutputBlocks: []schemas.ResponsesMessageContentBlock{{Type: alias}}}}}}
-        normalizeCursorFunctionCallOutputs(req)
-        if got := req.Input.OpenAIResponsesRequestInputArray[0].Output.ResponsesFunctionToolCallOutputBlocks[0].Type; got != schemas.ResponsesInputMessageContentBlockTypeText { t.Fatalf("alias %q became %q", alias, got) }
-    }
+	itemType := schemas.ResponsesMessageTypeFunctionCallOutput
+	for _, alias := range []schemas.ResponsesMessageContentBlockType{"text", schemas.ResponsesOutputMessageContentTypeText} {
+		req := &openai.OpenAIResponsesRequest{}
+		req.Input.OpenAIResponsesRequestInputArray = []schemas.ResponsesMessage{{Type: &itemType, ResponsesToolMessage: &schemas.ResponsesToolMessage{Output: &schemas.ResponsesToolMessageOutputStruct{ResponsesFunctionToolCallOutputBlocks: []schemas.ResponsesMessageContentBlock{{Type: alias}}}}}}
+		normalizeCursorFunctionCallOutputs(req)
+		if got := req.Input.OpenAIResponsesRequestInputArray[0].Output.ResponsesFunctionToolCallOutputBlocks[0].Type; got != schemas.ResponsesInputMessageContentBlockTypeText {
+			t.Fatalf("alias %q became %q", alias, got)
+		}
+	}
 }

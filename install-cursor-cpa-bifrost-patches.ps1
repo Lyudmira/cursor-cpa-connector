@@ -428,6 +428,229 @@ func addCursorClaudeToolCacheBreakpoint(req *openai.OpenAIResponsesRequest) {
         throw "Expected exactly one Claude cache helper definition: $cursorGo"
     }
 
+    # Upgrade to the final, fully-verified breakpoint scheme (idempotent: matches and
+    # replaces ANY earlier generation of this function family — the original tool-only
+    # breakpoint, or the tool+system-message intermediate version — so upgrading an
+    # existing install skips straight to the version below regardless of which generation
+    # it currently has installed).
+    #
+    # This version was arrived at after extensive live debugging against a production
+    # Cursor + muskapi (Anthropic-compatible) setup; see
+    # log/major_fix/<commit>_cache_control_incremental_fix.md in this repo for the full
+    # investigation. Summary of what changed vs. the tool+system-message version above:
+    #
+    #   - No tool-level breakpoint at all. Confirmed empirically: a breakpoint on a
+    #     message content block alone (no tool breakpoint) still correctly caches the
+    #     tools array, because Anthropic's cache_control breakpoints cover everything
+    #     earlier in the request's fixed content ordering (tools, then system, then
+    #     messages). Spending one of Anthropic's 4 allowed breakpoints on the tools array
+    #     specifically was wasted budget.
+    #   - Model matching tolerates a Bifrost "provider/model" address prefix (e.g.
+    #     "muskapi/claude-sonnet-5"), which is what Cursor's configured custom model name
+    #     actually looks like once routed through a named provider — a bare "claude-"
+    #     prefix check silently no-ops for these.
+    #   - Cursor's real traffic does not send a dedicated system/developer message at all;
+    #     everything is folded into the first message (role=user). The stable-anchor
+    #     breakpoint falls back to the first message in that case.
+    #   - Four breakpoints total (Anthropic's per-request max), all message-level:
+    #     stable anchor (first/system message), absolute last message, absolute
+    #     second-to-last message (the pair lets a Cursor tool-calling loop within a single
+    #     turn accumulate cache turn-over-turn), and the second-to-last *user*-role
+    #     message (realigns across a full turn boundary, which typically appends more
+    #     than the 1-2 items the absolute-position pair assumes).
+    $cursorContent = Get-Content -Raw -LiteralPath $cursorGo
+    if ($cursorContent -notmatch "isClaudeCursorModel") {
+        $finalUpgradePattern = '(?s)// addCursorClaudeToolCacheBreakpoint adds.*?(?=// normalizeInputContentBlocks ensures)'
+        if ($cursorContent -notmatch $finalUpgradePattern) {
+            throw "Could not locate addCursorClaudeToolCacheBreakpoint function family to upgrade to the final version in $cursorGo"
+        }
+        $finalBlock = @'
+// isClaudeCursorModel reports whether model refers to a Claude model, tolerating a
+// Bifrost "provider/model" address prefix (e.g. "muskapi/claude-sonnet-5") in addition
+// to a bare model name (e.g. "claude-sonnet-5"). Cursor's configured custom model name
+// is whatever the routing setup uses to address the upstream, which is frequently
+// provider-prefixed; matching only a bare "claude-" prefix silently no-ops for those
+// requests.
+func isClaudeCursorModel(model string) bool {
+	m := strings.ToLower(model)
+	if idx := strings.LastIndex(m, "/"); idx >= 0 {
+		m = m[idx+1:]
+	}
+	return strings.HasPrefix(m, "claude-")
+}
+
+// addCursorClaudeToolCacheBreakpoint adds Anthropic-compatible cache breakpoints to
+// Cursor's request when the client did not provide one. Limiting the change to Claude
+// requests avoids leaking provider-specific behavior to other models.
+//
+// This does NOT mark a tool directly (despite the name, kept for compatibility with
+// existing callers/tests). Confirmed empirically against a production Anthropic-compatible
+// upstream: a breakpoint on the last tool with nothing else marked creates NO cache entry
+// at all -- neither cache_creation_input_tokens nor cache_read_input_tokens. But a
+// breakpoint on a message content block alone (no tool breakpoint) correctly caches
+// everything before it, tools included -- Anthropic's cache_control breakpoints cover all
+// content earlier in the request's fixed ordering (tools, then system, then messages), so
+// a message-level breakpoint already subsumes the tools. Spending one of Anthropic's 4
+// allowed breakpoints on the tools array specifically is therefore wasted budget; all 4
+// are used for message-level breakpoints instead (see addCursorClaudeSystemCacheBreakpoint).
+func addCursorClaudeToolCacheBreakpoint(req *openai.OpenAIResponsesRequest) {
+	if req == nil || !isClaudeCursorModel(req.Model) {
+		return
+	}
+	if cursorRequestHasExplicitCacheControl(req) {
+		return
+	}
+	addCursorClaudeSystemCacheBreakpoint(req)
+}
+
+// cursorRequestHasExplicitCacheControl reports whether the client already supplied a
+// cache_control anywhere in the request (any tool, or any input message / content
+// block), in which case Bifrost defers entirely to the client's own cache policy
+// instead of layering an additional breakpoint on top of it.
+func cursorRequestHasExplicitCacheControl(req *openai.OpenAIResponsesRequest) bool {
+	for i := range req.Tools {
+		if req.Tools[i].CacheControl != nil {
+			return true
+		}
+	}
+	for i := range req.Input.OpenAIResponsesRequestInputArray {
+		msg := &req.Input.OpenAIResponsesRequestInputArray[i]
+		if msg.CacheControl != nil {
+			return true
+		}
+		if msg.Content == nil {
+			continue
+		}
+		for j := range msg.Content.ContentBlocks {
+			if msg.Content.ContentBlocks[j].CacheControl != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// setCursorMessageCacheBreakpoint marks msg as a cache checkpoint. Regular content
+// messages carry cache_control on their last content block; function_call and
+// function_call_output items carry it on the message itself (see ResponsesMessage.
+// CacheControl). Returns false if msg has nothing markable.
+func setCursorMessageCacheBreakpoint(msg *schemas.ResponsesMessage) bool {
+	if msg == nil {
+		return false
+	}
+	if msg.Type != nil && (*msg.Type == schemas.ResponsesMessageTypeFunctionCall || *msg.Type == schemas.ResponsesMessageTypeFunctionCallOutput) {
+		msg.CacheControl = &schemas.CacheControl{Type: schemas.CacheControlTypeEphemeral}
+		return true
+	}
+	if msg.Content == nil || len(msg.Content.ContentBlocks) == 0 {
+		return false
+	}
+	last := &msg.Content.ContentBlocks[len(msg.Content.ContentBlocks)-1]
+	last.CacheControl = &schemas.CacheControl{Type: schemas.CacheControlTypeEphemeral}
+	return true
+}
+
+// addCursorClaudeSystemCacheBreakpoint marks the stable prefix boundary, plus a sliding
+// window covering both the growing tail WITHIN a turn (a Cursor tool-calling loop:
+// assistant tool_call, tool_result, assistant tool_call, tool_result, ...) and realignment
+// ACROSS turns (when the next real user message arrives).
+//
+// The stable-prefix breakpoint alone is not enough for multi-turn caching to actually
+// accumulate: Cursor's first message (or an explicit system/developer message, when
+// present) never changes, but every later turn appends new messages after it. Anchoring
+// the only breakpoint there means each turn only ever re-reads that same fixed prefix --
+// the growing tail in between is recomputed at full price every single turn and never
+// itself becomes part of the cache.
+//
+// Uses all 4 of Anthropic's allowed breakpoints per request, all message-level (see
+// addCursorClaudeToolCacheBreakpoint for why a tool-level breakpoint is unnecessary once
+// a message-level one is present):
+//
+//  1. Stable anchor -- the last system/developer message, or (Cursor's actual shape: no
+//     dedicated system message at all) the first message in the array, which stays
+//     byte-identical across the whole conversation.
+//  2. Absolute last message, whatever its role. This is what lets a tool-calling loop
+//     WITHIN a single turn accumulate cache too: each tool_call/tool_result round appends
+//     to the end of the array, and marking the true last item every time -- not just the
+//     last *user* message -- means each round's request can read what the previous round
+//     (moments earlier, same turn) wrote and extend it, instead of leaving everything
+//     between the turn's original user query and the current tool round permanently
+//     uncached until the turn finally ends.
+//  3. Absolute second-to-last message. Pairs with #2 for the common case where a turn
+//     produces exactly one new item since the last request in the same loop (their
+//     positions must both be present for the read to hit turn-over-turn).
+//  4. Second-to-last *user*-role message. Handles realignment across a full turn boundary,
+//     where Cursor appends more than the 1-2 items #2/#3 assume (the previous turn's
+//     trailing tool calls, its final assistant reply, AND the new user query). Cursor's
+//     history is a strict append -- earlier messages are never mutated -- so whatever user
+//     message was "the latest" when the previous turn built its own breakpoints is always
+//     exactly "the second-to-last user message" by the time this turn looks at the same
+//     history, regardless of how much non-user content sits between them. Confirmed
+//     against production Cursor traffic across 4 consecutive turns with adequate spacing
+//     between requests for the upstream's cache writes to propagate: read tokens matched
+//     the previous turn's write exactly, every turn, only the small per-turn delta was
+//     freshly written each time.
+func addCursorClaudeSystemCacheBreakpoint(req *openai.OpenAIResponsesRequest) {
+	n := len(req.Input.OpenAIResponsesRequestInputArray)
+	if n == 0 {
+		return
+	}
+
+	markedStableAnchor := false
+	for i := n - 1; i >= 0; i-- {
+		msg := &req.Input.OpenAIResponsesRequestInputArray[i]
+		if msg.Role == nil {
+			continue
+		}
+		if *msg.Role != schemas.ResponsesInputMessageRoleSystem && *msg.Role != schemas.ResponsesInputMessageRoleDeveloper {
+			continue
+		}
+		markedStableAnchor = setCursorMessageCacheBreakpoint(msg)
+		break
+	}
+	if !markedStableAnchor {
+		// No system/developer message: Cursor's production traffic folds all static
+		// context (including what would normally be a system prompt) into the first
+		// message, which is always role=user and verified to stay byte-identical across
+		// a conversation while later turns are appended after it.
+		setCursorMessageCacheBreakpoint(&req.Input.OpenAIResponsesRequestInputArray[0])
+	}
+
+	// #2 and #3: absolute last two messages, covering within-turn tool-loop growth.
+	setCursorMessageCacheBreakpoint(&req.Input.OpenAIResponsesRequestInputArray[n-1])
+	if n >= 2 {
+		setCursorMessageCacheBreakpoint(&req.Input.OpenAIResponsesRequestInputArray[n-2])
+	}
+
+	// #4: second-to-last user-role message, covering realignment across a full turn
+	// boundary. See the function comment for why role-indexing (not raw position) is
+	// required here.
+	marked := 0
+	for i := n - 1; i >= 0 && marked < 2; i-- {
+		msg := &req.Input.OpenAIResponsesRequestInputArray[i]
+		if msg.Role == nil || *msg.Role != schemas.ResponsesInputMessageRoleUser {
+			continue
+		}
+		if marked == 1 {
+			setCursorMessageCacheBreakpoint(msg)
+		}
+		marked++
+	}
+}
+
+'@
+        $cursorContent = [regex]::Replace($cursorContent, $finalUpgradePattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $finalBlock }, 1)
+        Save-Utf8NoBom $cursorGo $cursorContent
+    }
+
+    $cursorContent = Get-Content -Raw -LiteralPath $cursorGo
+    if ([regex]::Matches($cursorContent, 'func addCursorClaudeSystemCacheBreakpoint').Count -ne 1) {
+        throw "Expected exactly one Claude system cache breakpoint helper definition: $cursorGo"
+    }
+    if ([regex]::Matches($cursorContent, 'func isClaudeCursorModel').Count -ne 1) {
+        throw "Expected exactly one isClaudeCursorModel helper definition: $cursorGo"
+    }
+
     $schemaCompatTest = Join-Path $SourceRoot "core\schemas\cursor_connector_compat_test.go"
     $cursorCompatTest = Join-Path $SourceRoot "transports\bifrost-http\integrations\cursor_connector_compat_test.go"
     Copy-Item -Force (Join-Path $PSScriptRoot "bifrost_responses_compat_test.go") $schemaCompatTest
