@@ -52,7 +52,7 @@ You can run config alone:
 
 Copied wholesale into `internal/translator/codex/openai/responses/codex_openai-responses_request.go`.
 
-- `sanitizeCodexResponsesInputItems` - `system` -> `developer` on messages; strip `role` from non-message items; `text`/`output_text` -> `input_text` on `function_call_output`.
+- `sanitizeCodexResponsesInputItems` - `system` -> `developer` on messages; preserve the legacy broad non-message `role` cleanup for known older Codex models; keep `additional_tools.role` for newer models such as `gpt-5.6-*`; normalize nested `additional_tools.tools` descriptors to Responses tool schema; `text`/`output_text` -> `input_text` on `function_call_output`.
 - `removeUnsupportedCursorCustomToolsForCodexBYOK` - drop Cursor `ApplyPatch` custom tool on BYOK routes.
 - `addCodexBYOKToolCompatibilityInstruction` - optional instruction when Shell is present without ApplyPatch.
 - `normalizeCodexBuiltinTools` - e.g. `web_search_preview` -> `web_search`.

@@ -75,7 +75,11 @@ function Apply-CPA-Patch([string]$SourceRoot) {
         Copy-Item -Force $requestPatchFile $responsesRequest
     } else {
     $content = Get-Content -Raw -LiteralPath $responsesRequest
-    $content = $content -replace "rawJSON = convertSystemRoleToDeveloper\(rawJSON\)", "rawJSON = sanitizeCodexResponsesInputItems(rawJSON)"
+    if ($content -notmatch '"strings"') {
+        $content = $content -replace '("fmt"\r?\n)', "`$1`t`"strings`"`r`n"
+    }
+    $content = $content -replace "rawJSON = convertSystemRoleToDeveloper\(rawJSON\)", "rawJSON = sanitizeCodexResponsesInputItems(modelName, rawJSON)"
+    $content = $content -replace "rawJSON = sanitizeCodexResponsesInputItems\(rawJSON\)", "rawJSON = sanitizeCodexResponsesInputItems(modelName, rawJSON)"
 
     $oldFuncPattern = '(?s)// convertSystemRoleToDeveloper traverses the input array.*?func convertSystemRoleToDeveloper\(rawJSON \[\]byte\) \[\]byte \{.*?return updated\s*\}'
     $sanitizeFuncPattern = '(?s)// sanitizeCodexResponsesInputItems traverses the input array.*?func normalizeFunctionCallOutputContentTypes\(itemRaw \[\]byte\) \(\[\]byte, bool, error\) \{.*?return updated, changed, nil\s*\}'
@@ -83,9 +87,13 @@ function Apply-CPA-Patch([string]$SourceRoot) {
 // sanitizeCodexResponsesInputItems traverses the input array and normalizes item
 // fields to the narrower schema accepted by Codex upstream.
 //
-// Message items keep their role, except "system" becomes "developer". Non-message
-// items such as function_call and function_call_output do not accept role.
-func sanitizeCodexResponsesInputItems(rawJSON []byte) []byte {
+// Message items keep their role, except "system" becomes "developer".
+//
+// Known legacy Codex models rejected role on non-message history items such as
+// function_call/function_call_output, so preserve that broad cleanup for them.
+// Newer models may send additional_tools as a developer-scoped input item;
+// stripping that role causes "Missing required parameter: input[0].role".
+func sanitizeCodexResponsesInputItems(modelName string, rawJSON []byte) []byte {
 	inputResult := gjson.GetBytes(rawJSON, "input")
 	if !inputResult.IsArray() {
 		return rawJSON
@@ -111,7 +119,7 @@ func sanitizeCodexResponsesInputItems(rawJSON []byte) []byte {
 					itemRaw = updatedItem
 					changed = true
 				}
-			} else if item.Get("role").Exists() {
+			} else if shouldStripCodexInputRole(modelName, itemType) && item.Get("role").Exists() {
 				updatedItem, errDeleteItem := sjson.DeleteBytes(itemRaw, "role")
 				if errDeleteItem != nil {
 					return rawJSON
@@ -122,6 +130,14 @@ func sanitizeCodexResponsesInputItems(rawJSON []byte) []byte {
 			if itemType == "function_call_output" {
 				updatedItem, itemChanged, errNormalizeOutput := normalizeFunctionCallOutputContentTypes(itemRaw)
 				if errNormalizeOutput != nil {
+					return rawJSON
+				}
+				itemRaw = updatedItem
+				changed = changed || itemChanged
+			}
+			if itemType == "additional_tools" {
+				updatedItem, itemChanged, errNormalizeTools := normalizeAdditionalToolsInputItem(itemRaw)
+				if errNormalizeTools != nil {
 					return rawJSON
 				}
 				itemRaw = updatedItem
@@ -143,6 +159,99 @@ func sanitizeCodexResponsesInputItems(rawJSON []byte) []byte {
 		return rawJSON
 	}
 	return updated
+}
+
+func shouldStripCodexInputRole(modelName string, itemType string) bool {
+	if itemType == "message" {
+		return false
+	}
+	if isLegacyCodexInputRoleModel(modelName) {
+		return true
+	}
+	return itemType != "additional_tools"
+}
+
+func isLegacyCodexInputRoleModel(modelName string) bool {
+	model := strings.ToLower(strings.TrimSpace(modelName))
+	if slash := strings.LastIndex(model, "/"); slash >= 0 {
+		model = strings.TrimSpace(model[slash+1:])
+	}
+	switch model {
+	case "gpt-5.2",
+		"gpt-5.3",
+		"gpt-5.3-codex",
+		"gpt-5.3-codex-spark",
+		"gpt-5.3-codex-spark-preview",
+		"gpt-5.4",
+		"gpt-5.4-mini",
+		"gpt-5.4-openai-compact",
+		"gpt-5.5",
+		"gpt-5.5-openai-compact":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeAdditionalToolsInputItem(itemRaw []byte) ([]byte, bool, error) {
+	toolsResult := gjson.GetBytes(itemRaw, "tools")
+	if !toolsResult.IsArray() {
+		return itemRaw, false, nil
+	}
+
+	changed := false
+	rebuiltTools := make([]json.RawMessage, 0, len(toolsResult.Array()))
+	for _, tool := range toolsResult.Array() {
+		toolRaw := []byte(tool.Raw)
+		if tool.IsObject() {
+			if !tool.Get("type").Exists() {
+				updatedTool, errSetType := sjson.SetBytes(toolRaw, "type", "function")
+				if errSetType != nil {
+					return itemRaw, false, errSetType
+				}
+				toolRaw = updatedTool
+				changed = true
+			}
+
+			tool = gjson.ParseBytes(toolRaw)
+			inputSchema := tool.Get("input_schema")
+			if inputSchema.Exists() {
+				if !tool.Get("parameters").Exists() {
+					var errSetParameters error
+					if inputSchema.Type == gjson.Null {
+						toolRaw, errSetParameters = sjson.SetRawBytes(toolRaw, "parameters", []byte(`{"type":"object","properties":{}}`))
+					} else {
+						toolRaw, errSetParameters = sjson.SetRawBytes(toolRaw, "parameters", []byte(inputSchema.Raw))
+					}
+					if errSetParameters != nil {
+						return itemRaw, false, errSetParameters
+					}
+					changed = true
+				}
+
+				updatedTool, errDeleteInputSchema := sjson.DeleteBytes(toolRaw, "input_schema")
+				if errDeleteInputSchema != nil {
+					return itemRaw, false, errDeleteInputSchema
+				}
+				toolRaw = updatedTool
+				changed = true
+			}
+		}
+		rebuiltTools = append(rebuiltTools, json.RawMessage(toolRaw))
+	}
+	if !changed {
+		return itemRaw, false, nil
+	}
+
+	toolsRaw, errMarshalTools := json.Marshal(rebuiltTools)
+	if errMarshalTools != nil {
+		return itemRaw, false, errMarshalTools
+	}
+	updated, errSetTools := sjson.SetRawBytes(itemRaw, "tools", toolsRaw)
+	if errSetTools != nil {
+		return itemRaw, false, errSetTools
+	}
+	return updated, true, nil
 }
 
 func normalizeFunctionCallOutputContentTypes(itemRaw []byte) ([]byte, bool, error) {
