@@ -273,8 +273,13 @@ func normalizeAdditionalToolsInputItem(itemRaw []byte) ([]byte, bool, error) {
 	for _, tool := range toolsResult.Array() {
 		toolRaw := []byte(tool.Raw)
 		if tool.IsObject() {
+			inputSchema := tool.Get("input_schema")
 			if !tool.Get("type").Exists() {
-				updatedTool, errSetType := sjson.SetBytes(toolRaw, "type", "function")
+				toolType := "function"
+				if inputSchema.Exists() && inputSchema.Type == gjson.Null {
+					toolType = "custom"
+				}
+				updatedTool, errSetType := sjson.SetBytes(toolRaw, "type", toolType)
 				if errSetType != nil {
 					return itemRaw, false, errSetType
 				}
@@ -283,15 +288,11 @@ func normalizeAdditionalToolsInputItem(itemRaw []byte) ([]byte, bool, error) {
 			}
 
 			tool = gjson.ParseBytes(toolRaw)
-			inputSchema := tool.Get("input_schema")
+			inputSchema = tool.Get("input_schema")
 			if inputSchema.Exists() {
-				if !tool.Get("parameters").Exists() {
+				if inputSchema.Type != gjson.Null && tool.Get("type").String() == "function" && !tool.Get("parameters").Exists() {
 					var errSetParameters error
-					if inputSchema.Type == gjson.Null {
-						toolRaw, errSetParameters = sjson.SetRawBytes(toolRaw, "parameters", []byte(`{"type":"object","properties":{}}`))
-					} else {
-						toolRaw, errSetParameters = sjson.SetRawBytes(toolRaw, "parameters", []byte(inputSchema.Raw))
-					}
+					toolRaw, errSetParameters = sjson.SetRawBytes(toolRaw, "parameters", []byte(inputSchema.Raw))
 					if errSetParameters != nil {
 						return itemRaw, false, errSetParameters
 					}
