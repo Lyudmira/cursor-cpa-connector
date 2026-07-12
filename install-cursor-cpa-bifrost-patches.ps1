@@ -204,8 +204,13 @@ func normalizeAdditionalToolsInputItem(itemRaw []byte) ([]byte, bool, error) {
 	for _, tool := range toolsResult.Array() {
 		toolRaw := []byte(tool.Raw)
 		if tool.IsObject() {
+			inputSchema := tool.Get("input_schema")
 			if !tool.Get("type").Exists() {
-				updatedTool, errSetType := sjson.SetBytes(toolRaw, "type", "function")
+				toolType := "function"
+				if inputSchema.Exists() && inputSchema.Type == gjson.Null {
+					toolType = "custom"
+				}
+				updatedTool, errSetType := sjson.SetBytes(toolRaw, "type", toolType)
 				if errSetType != nil {
 					return itemRaw, false, errSetType
 				}
@@ -214,15 +219,11 @@ func normalizeAdditionalToolsInputItem(itemRaw []byte) ([]byte, bool, error) {
 			}
 
 			tool = gjson.ParseBytes(toolRaw)
-			inputSchema := tool.Get("input_schema")
+			inputSchema = tool.Get("input_schema")
 			if inputSchema.Exists() {
-				if !tool.Get("parameters").Exists() {
+				if inputSchema.Type != gjson.Null && tool.Get("type").String() == "function" && !tool.Get("parameters").Exists() {
 					var errSetParameters error
-					if inputSchema.Type == gjson.Null {
-						toolRaw, errSetParameters = sjson.SetRawBytes(toolRaw, "parameters", []byte(`{"type":"object","properties":{}}`))
-					} else {
-						toolRaw, errSetParameters = sjson.SetRawBytes(toolRaw, "parameters", []byte(inputSchema.Raw))
-					}
+					toolRaw, errSetParameters = sjson.SetRawBytes(toolRaw, "parameters", []byte(inputSchema.Raw))
 					if errSetParameters != nil {
 						return itemRaw, false, errSetParameters
 					}
@@ -344,6 +345,12 @@ function Apply-Bifrost-Patch([string]$SourceRoot) {
 
     $content = Get-Content -Raw -LiteralPath $responsesGo
     $content = $content -replace 'Strict\s+\*bool\s+`json:"strict"`', 'Strict     *bool                   `json:"strict,omitempty"`'
+    # Bifrost main briefly retained a write to the removed rawToolSearch field after
+    # replacing it with rawPreserved. Remove only that stale assignment when the field
+    # declaration is absent so current main remains buildable without affecting older refs.
+    if ($content -notmatch 'rawToolSearch\s+\[\]byte' -and $content -match 'm\.rawToolSearch = append\(\[\]byte\(nil\), data\.\.\.\)') {
+        $content = $content -replace '(?m)^\s*m\.rawToolSearch = append\(\[\]byte\(nil\), data\.\.\.\)\r?\n', ''
+    }
 
     $muxGo = Join-Path $SourceRoot "core\schemas\mux.go"
     if (-not (Test-Path $muxGo)) {
@@ -760,14 +767,80 @@ func addCursorClaudeSystemCacheBreakpoint(req *openai.OpenAIResponsesRequest) {
         throw "Expected exactly one isClaudeCursorModel helper definition: $cursorGo"
     }
 
+    # Install the fixed, Responses-only thinking-high alias table in core/schemas.
+    # Request parsing and model-list presentation both consume this shared table so
+    # their supported aliases cannot drift apart.
+    $thinkingHighGo = Join-Path $SourceRoot "core\schemas\cursor_thinking_high_alias.go"
+    $thinkingHighTest = Join-Path $SourceRoot "core\schemas\cursor_thinking_high_alias_test.go"
+    Copy-Item -Force (Join-Path $PSScriptRoot "bifrost_thinking_high_alias.go") $thinkingHighGo
+    Copy-Item -Force (Join-Path $PSScriptRoot "bifrost_thinking_high_alias_test.go") $thinkingHighTest
+
+    $inferenceGo = Join-Path $SourceRoot "transports\bifrost-http\handlers\inference.go"
+    if (-not (Test-Path $inferenceGo)) {
+        throw "Bifrost inference handler not found: $inferenceGo"
+    }
+    $inferenceContent = Get-Content -Raw -LiteralPath $inferenceGo
+    if ($inferenceContent -notmatch 'ApplyCursorThinkingHighAlias') {
+        $thinkingHighBlock = @'
+	if req.ResponsesParameters == nil {
+		req.ResponsesParameters = &schemas.ResponsesParameters{}
+	}
+	// Only the connector's explicit, fixed thinking-high aliases take this path.
+	// Clear any provider parsed from an alias such as muskapi/claude-... so the
+	// restored base model goes through the existing routing rules.
+	if baseModel, ok := schemas.ApplyCursorThinkingHighAlias(req.Model, req.ResponsesParameters); ok {
+		req.Model = baseModel
+		base.Provider = ""
+		base.ModelName = baseModel
+	}
+'@
+        $responsesParamsPattern = '(?m)^\tif req\.ResponsesParameters == nil \{\r?\n\t\treq\.ResponsesParameters = &schemas\.ResponsesParameters\{\}\r?\n\t\}'
+        if ($inferenceContent -notmatch $responsesParamsPattern) {
+            throw "Could not locate Responses parameter initialization in $inferenceGo"
+        }
+        $inferenceContent = [regex]::Replace($inferenceContent, $responsesParamsPattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $thinkingHighBlock.TrimEnd() }, 1)
+
+        $enrichCall = "`tenrichListModelsResponse(resp, h.config.ModelCatalog)"
+        $enrichWithAliases = "`tenrichListModelsResponse(resp, h.config.ModelCatalog)`r`n`tschemas.AppendCursorThinkingHighModels(resp)"
+        if (-not $inferenceContent.Contains($enrichCall)) {
+            throw "Could not locate /v1/models enrichment in $inferenceGo"
+        }
+        $inferenceContent = $inferenceContent.Replace($enrichCall, $enrichWithAliases)
+        Save-Utf8NoBom $inferenceGo $inferenceContent
+    }
+
+    $openAIIntegrationGo = Join-Path $SourceRoot "transports\bifrost-http\integrations\openai.go"
+    if (-not (Test-Path $openAIIntegrationGo)) {
+        throw "Bifrost OpenAI integration not found: $openAIIntegrationGo"
+    }
+    $openAIIntegrationContent = Get-Content -Raw -LiteralPath $openAIIntegrationGo
+    if ($openAIIntegrationContent -notmatch 'AppendCursorThinkingHighModels') {
+        $cursorListModelsConverter = @'
+			ListModelsResponseConverter: func(ctx *schemas.BifrostContext, resp *schemas.BifrostListModelsResponse) (interface{}, error) {
+				if pathPrefix == "/cursor" {
+					schemas.AppendCursorThinkingHighModels(resp)
+				}
+				return openai.ToOpenAIListModelsResponse(resp), nil
+			},
+'@
+        $listModelsConverterPattern = '(?m)^\t\t\tListModelsResponseConverter: func\(ctx \*schemas\.BifrostContext, resp \*schemas\.BifrostListModelsResponse\) \(interface\{\}, error\) \{\r?\n\t\t\t\treturn openai\.ToOpenAIListModelsResponse\(resp\), nil\r?\n\t\t\t\},'
+        if ($openAIIntegrationContent -notmatch $listModelsConverterPattern) {
+            throw "Could not locate OpenAI list-model converter in $openAIIntegrationGo"
+        }
+        $openAIIntegrationContent = [regex]::Replace($openAIIntegrationContent, $listModelsConverterPattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $cursorListModelsConverter.TrimEnd() }, 1)
+        Save-Utf8NoBom $openAIIntegrationGo $openAIIntegrationContent
+    }
+
     $schemaCompatTest = Join-Path $SourceRoot "core\schemas\cursor_connector_compat_test.go"
     $cursorCompatTest = Join-Path $SourceRoot "transports\bifrost-http\integrations\cursor_connector_compat_test.go"
+    $thinkingHighHandlerTest = Join-Path $SourceRoot "transports\bifrost-http\handlers\cursor_thinking_high_test.go"
     Copy-Item -Force (Join-Path $PSScriptRoot "bifrost_responses_compat_test.go") $schemaCompatTest
     Copy-Item -Force (Join-Path $PSScriptRoot "bifrost_cursor_compat_test.go") $cursorCompatTest
+    Copy-Item -Force (Join-Path $PSScriptRoot "bifrost_thinking_high_handler_test.go") $thinkingHighHandlerTest
 
     Push-Location $SourceRoot
     try {
-        gofmt -w $responsesGo $muxGo $cursorGo $schemaCompatTest $cursorCompatTest
+        gofmt -w $responsesGo $muxGo $cursorGo $thinkingHighGo $thinkingHighTest $inferenceGo $openAIIntegrationGo $schemaCompatTest $cursorCompatTest $thinkingHighHandlerTest
 
         Push-Location (Join-Path $SourceRoot "core")
         try {
@@ -788,6 +861,8 @@ func addCursorClaudeSystemCacheBreakpoint(req *openai.OpenAIResponsesRequest) {
         try {
             go test ./bifrost-http/integrations -run CursorConnector -count=1
             if ($LASTEXITCODE -ne 0) { throw "Bifrost Cursor compatibility tests failed" }
+            go test ./bifrost-http/handlers -run CursorConnector -count=1
+            if ($LASTEXITCODE -ne 0) { throw "Bifrost thinking-high handler tests failed" }
         } finally {
             Pop-Location
             if ($createdGoWork) {
