@@ -1,0 +1,27 @@
+# Patched CLIProxyAPI (cpa) build: cross-compile the same patched Go source
+# used for cli-proxy-api-patched.exe into a Linux binary, containerized so it
+# rides Docker Desktop's "unless-stopped" restart policy instead of relying
+# on a Windows-side autostart mechanism that never existed.
+FROM golang:1.26.4-alpine3.23 AS builder
+WORKDIR /build
+RUN apk upgrade --no-cache && apk add --no-cache git
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG VERSION=local-patch
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+    -ldflags="-s -w -X 'main.Version=${VERSION}'" \
+    -o /app/cli-proxy-api ./cmd/server
+RUN test -f /app/cli-proxy-api
+
+FROM alpine:3.23.4
+RUN apk upgrade --no-cache && apk add --no-cache ca-certificates tzdata
+WORKDIR /CLIProxyAPI
+COPY --from=builder /app/cli-proxy-api /CLIProxyAPI/cli-proxy-api
+RUN adduser -D -s /bin/sh appuser \
+    && mkdir -p /CLIProxyAPI/auths /CLIProxyAPI/static /CLIProxyAPI/logs \
+    && chown -R appuser:appuser /CLIProxyAPI
+USER appuser
+EXPOSE 8317
+ENTRYPOINT ["/CLIProxyAPI/cli-proxy-api"]
+CMD ["--config", "/CLIProxyAPI/config.yaml"]

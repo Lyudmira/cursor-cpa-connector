@@ -201,6 +201,10 @@ Restart Codex / reload the extension once after creating or changing `managed_co
 | `codex_openai_responses_request.go` | Full Responses **request** translator patch |
 | `codex_openai_response.go` | Chat-completions response patch (PR #4079) |
 | `Dockerfile.bifrost-patched` | Patched Bifrost image build recipe |
+| `Dockerfile.cpa-patched` | Patched CPA image build recipe (Linux binary, same patched source as the `.exe`) |
+| `build-patched-cpa.ps1` | Windows/PowerShell: patch + test + build CPA `.exe` and native debug binary, then build `cpa-patched:local` and redeploy the `cpa` container (`--restart unless-stopped`) |
+| `build-patched-cpa.sh` | bash equivalent of the above (git-bash or real Linux/macOS); paths overridable via `CPA_SRC` / `CPA_PROJECT_DIR` / etc. env vars |
+| `config.docker.yaml.example` | Sanitized template for the CPA config the `cpa` container reads (`auth-dir` rewritten to the container path); copy to `config.docker.yaml` (gitignored) and fill in real `api-keys` / `remote-management.secret-key` |
 | `next_steps_plan.md` | Notes on Cursor custom-model routing experiments (not applied by install) |
 
 ## Caveats

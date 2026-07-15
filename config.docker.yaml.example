@@ -1,0 +1,31 @@
+host: "0.0.0.0"
+port: 8317
+auth-dir: "/CLIProxyAPI/auths"
+api-keys:
+  - "sk-cpa-local"
+  # add more client-facing keys here; keep the real file (config.docker.yaml,
+  # gitignored) out of version control -- these are bearer tokens, not hashes.
+remote-management:
+  allow-remote: true
+  # bcrypt hash of your management panel password, e.g. via:
+  #   htpasswd -bnBC 10 "" "your-password" | cut -d: -f2
+  secret-key: "$2a$10$REPLACE_WITH_YOUR_OWN_BCRYPT_HASH"
+  disable-control-panel: false
+debug: true
+logging-to-file: true
+logs-max-total-size-mb: 50
+usage-statistics-enabled: true
+redis-usage-queue-retention-seconds: 3600
+request-retry: 3
+max-retry-credentials: 0
+max-retry-interval: 30
+quota-exceeded:
+  switch-project: true
+  switch-preview-model: false
+routing:
+  strategy: "fill-first"
+  session-affinity: false
+oauth-model-alias:
+  codex:
+    - name: gpt-5.3-codex-spark
+      alias: gpt-5.3-codex-spark-preview
