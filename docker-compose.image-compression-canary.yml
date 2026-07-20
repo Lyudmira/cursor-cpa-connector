@@ -1,0 +1,28 @@
+services:
+  cursor-image-compressor-canary:
+    image: cursor-claude-image-compressor:local
+    build:
+      context: ./image-compressor
+    expose: ["47822"]
+  bifrost-canary:
+    image: bifrost-patched:image-compression-20260720
+    build:
+      context: C:/Users/SurfacePro8/AppData/Local/Temp/cursor-cpa-connector/bifrost-src
+      dockerfile: Dockerfile.cursor-patched
+      args:
+        VERSION: image-compression-20260720
+    environment:
+      APP_PORT: "8080"
+      APP_HOST: "0.0.0.0"
+      APP_DIR: "/app/data"
+      CURSOR_CLAUDE_IMAGE_COMPRESSION: "shadow"
+      CURSOR_CLAUDE_IMAGE_COMPRESSOR_URL: "http://cursor-image-compressor-canary:47822/compress"
+      CURSOR_CLAUDE_IMAGE_COMPRESSION_STATIC: "on"
+      CURSOR_CLAUDE_IMAGE_COMPRESSION_TOOL_RESULTS: "on"
+      CURSOR_CLAUDE_IMAGE_COMPRESSION_HISTORY: "on"
+    extra_hosts: ["host.docker.internal:host-gateway"]
+    ports: ["127.0.0.1:8082:8080"]
+    volumes: ["C:/bifrost/data-canary:/app/data"]
+    depends_on:
+      cursor-image-compressor-canary:
+        condition: service_started

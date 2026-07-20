@@ -223,6 +223,42 @@ Restart Codex / reload the extension once after creating or changing `managed_co
 | `config.docker.yaml.example` | Sanitized template for the CPA config the `cpa` container reads (`auth-dir` rewritten to the container path); copy to `config.docker.yaml` (gitignored) and fill in real `api-keys` / `remote-management.secret-key` |
 | `next_steps_plan.md` | Notes on Cursor custom-model routing experiments (not applied by install) |
 
+
+## Claude image compression sidecar
+
+The patch kit includes `image-compressor/`, a local-network-only Node service for Claude Responses requests. Bifrost calls it after Cursor input normalization and before the existing four message-level cache breakpoints. GPT/Codex requests skip the hook, and every failure path keeps the parsed request unchanged.
+
+The master switch defaults to `off`:
+
+```yaml
+CURSOR_CLAUDE_IMAGE_COMPRESSION: "off" # off | shadow | on
+CURSOR_CLAUDE_IMAGE_COMPRESSION_STATIC: "off"
+CURSOR_CLAUDE_IMAGE_COMPRESSION_TOOL_RESULTS: "off"
+CURSOR_CLAUDE_IMAGE_COMPRESSION_HISTORY: "off"
+```
+
+`shadow` renders and records token estimates/PNG hashes while discarding the transformed request. `on` applies profitable buckets. The static slab removes system/developer text after rendering it, inserts image-only content before the first real user turn, and clears native tool descriptions while retaining tool names and schemas. Large tool results preserve call IDs, errors, and non-text blocks. History only freezes a closed prefix on a deterministic item grid, retaining the current request and live tail as native text.
+
+Each bucket applies only when the conservatively estimated image cost plus a safety allowance is below the text estimate. Rendering uses vendored, fixed Spleen atlas data and deterministic PNG encoding. Logs contain bucket, text/image token estimates, and SHA-256 PNG hashes; they contain no source text or credentials. Output validation rejects missing current-user text, duplicate/empty tool call IDs, excessive image count, and oversized bodies. Sidecar timeout, malformed output, validation failure, and an unprofitable gate all pass through the original request.
+
+Create `C:\bifrost\data\disable-image-compression` to force the hook off immediately. Bucket switches are independently disabled by default. The Compose service exposes port 47822 only inside the stack and does not change CPA, edge, provider, or routing ports.
+
+Before deployment:
+
+```powershell
+.\backup-image-compression.ps1
+# Start the isolated port 8082 canary in shadow mode:
+docker compose -f .\docker-compose.image-compression-canary.yml up -d --build
+```
+
+Use a fresh Cursor Claude session for validation. Leave 15-30 seconds between repeated requests, check that `cached_read_tokens` continues to grow, and compare total input/cache-create usage with compression disabled. Promote one bucket at a time only after its measured image estimate is lower. To roll back independently of the new Bifrost hook:
+
+```powershell
+.\rollback-image-compression.ps1 -Backup C:\CLIProxyAPI\backups\cursor-image-compression-YYYYMMDD-HHMMSS
+```
+
+The rollback script creates the kill-switch first, stops the compressor, restores Compose/edge files, reloads the saved `bifrost-patched:toolmerge-20260717-211419` image when necessary, and verifies Bifrost and Cursor model endpoints. It does not migrate CPA configuration, OAuth auths, or the routing database.
+
 ## Caveats
 
 - Without a backup upstream, models that only exist on the backup (for example spark-preview via centos) will not be routed.

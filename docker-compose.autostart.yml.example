@@ -17,6 +17,19 @@ services:
       start_period: 10s
       retries: 6
 
+  cursor-image-compressor:
+    image: cursor-claude-image-compressor:local
+    build:
+      context: C:/CLIProxyAPI/patches/cursor-cpa-connector/image-compressor
+    restart: unless-stopped
+    expose:
+      - "47822"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:47822/health || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+
   bifrost:
     image: bifrost-patched:local
     pull_policy: never
@@ -24,6 +37,8 @@ services:
     restart: unless-stopped
     depends_on:
       cpa:
+        condition: service_healthy
+      cursor-image-compressor:
         condition: service_healthy
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -33,6 +48,11 @@ services:
       LOG_LEVEL: "info"
       LOG_STYLE: "json"
       APP_DIR: "/app/data"
+      CURSOR_CLAUDE_IMAGE_COMPRESSION: "off"
+      CURSOR_CLAUDE_IMAGE_COMPRESSOR_URL: "http://cursor-image-compressor:47822/compress"
+      CURSOR_CLAUDE_IMAGE_COMPRESSION_STATIC: "off"
+      CURSOR_CLAUDE_IMAGE_COMPRESSION_TOOL_RESULTS: "off"
+      CURSOR_CLAUDE_IMAGE_COMPRESSION_HISTORY: "off"
     ports:
       - "127.0.0.1:8080:8080"
     volumes:

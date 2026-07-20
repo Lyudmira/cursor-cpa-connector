@@ -5,6 +5,8 @@ import (
 	"github.com/maximhq/bifrost/core/providers/openai"
 	"github.com/maximhq/bifrost/core/schemas"
 	"github.com/valyala/fasthttp"
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -423,5 +425,31 @@ func TestCursorConnectorNormalizesToolOutputsInBothParserPaths(t *testing.T) {
 				t.Fatalf("output type = %q, want input_text", got)
 			}
 		})
+	}
+}
+
+func TestCursorConnectorCompressionOffPreservesParsedRequest(t *testing.T) {
+	t.Setenv("CURSOR_CLAUDE_IMAGE_COMPRESSION", "off")
+	raw := `{"model":"claude-sonnet-5","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"unchanged"}]}]}`
+	req := parseCursorConnectorRequest(t, raw)
+	if got := cursorConnectorOutputText(&req.Input.OpenAIResponsesRequestInputArray[0]); got != "" {
+		t.Fatalf("unexpected tool output helper result: %q", got)
+	}
+	blocks := req.Input.OpenAIResponsesRequestInputArray[0].Content.ContentBlocks
+	if len(blocks) != 1 || blocks[0].Text == nil || *blocks[0].Text != "unchanged" {
+		t.Fatalf("off mode changed request content: %#v", blocks)
+	}
+}
+
+func TestCursorConnectorCompressionRunsBeforeCacheBreakpoints(t *testing.T) {
+	source, err := os.ReadFile("cursor.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	compress := strings.Index(text, "compressCursorClaudeRequest(cursorReq)")
+	cache := strings.Index(text, "addCursorClaudeToolCacheBreakpoint(cursorReq)")
+	if compress < 0 || cache < 0 || compress > cache {
+		t.Fatalf("compression must run before cache marking: compress=%d cache=%d", compress, cache)
 	}
 }

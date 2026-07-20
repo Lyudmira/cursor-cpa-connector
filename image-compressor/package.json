@@ -1,0 +1,7 @@
+{
+  "name": "cursor-claude-image-compressor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {"test": "node --test test/*.test.mjs"}
+}

@@ -512,7 +512,9 @@ case ResponsesToolTypeFunction:
     }
 
     $cursorToolResultsGo = Join-Path $SourceRoot "transports\bifrost-http\integrations\cursortoolresults.go"
+    $cursorCompressionGo = Join-Path $SourceRoot "transports\bifrost-http\integrations\cursorcompression.go"
     Copy-Item -Force (Join-Path $PSScriptRoot "bifrost_cursortoolresults.go") $cursorToolResultsGo
+    Copy-Item -Force (Join-Path $PSScriptRoot "bifrost_cursorcompression.go") $cursorCompressionGo
 
     $cursorContent = Get-Content -Raw -Encoding UTF8 -LiteralPath $cursorGo
     if ($cursorContent -notmatch "normalizeCursorFunctionCallOutputs") {
@@ -615,6 +617,16 @@ func addCursorClaudeToolCacheBreakpoint(req *openai.OpenAIResponsesRequest) {
     }
     if ([regex]::Matches($cursorContent, 'func addCursorClaudeToolCacheBreakpoint').Count -ne 1) {
         throw "Expected exactly one Claude cache helper definition: $cursorGo"
+    }
+
+    $compressionCallPattern = 'normalizeInputContentBlocks\(cursorReq\)\r?\n(\s*)addCursorClaudeToolCacheBreakpoint\(cursorReq\)'
+    $cursorContent = [regex]::Replace($cursorContent, $compressionCallPattern, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        "normalizeInputContentBlocks(cursorReq)`r`n$($m.Groups[1].Value)compressCursorClaudeRequest(cursorReq)`r`n$($m.Groups[1].Value)addCursorClaudeToolCacheBreakpoint(cursorReq)"
+    })
+    Save-Utf8NoBom $cursorGo $cursorContent
+    if ([regex]::Matches($cursorContent, 'compressCursorClaudeRequest\(cursorReq\)').Count -ne 2) {
+        throw "Expected Claude compression before cache marking in both Cursor parser paths: $cursorGo"
     }
 
     # Upgrade to the final, fully-verified breakpoint scheme (idempotent: matches and
@@ -916,7 +928,7 @@ func addCursorClaudeSystemCacheBreakpoint(req *openai.OpenAIResponsesRequest) {
 
     Push-Location $SourceRoot
     try {
-        & $script:GofmtExe -w $responsesGo $muxGo $cursorGo $cursorToolResultsGo $thinkingHighGo $thinkingHighTest $inferenceGo $openAIIntegrationGo $schemaCompatTest $cursorCompatTest $thinkingHighHandlerTest
+        & $script:GofmtExe -w $responsesGo $muxGo $cursorGo $cursorToolResultsGo $cursorCompressionGo $thinkingHighGo $thinkingHighTest $inferenceGo $openAIIntegrationGo $schemaCompatTest $cursorCompatTest $thinkingHighHandlerTest
 
         Push-Location (Join-Path $SourceRoot "core")
         try {
