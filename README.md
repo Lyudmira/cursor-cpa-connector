@@ -80,6 +80,8 @@ If that file is missing, the script falls back to the older inline regex patch (
 
 Bifrost is patched via regex against `main`, then built into `bifrost-patched:local`. With `-RestartBifrost`, install creates the data directory and runs the container.
 
+Use `-SkipBifrostBuild` to apply and test the Bifrost source patches without building a Docker image. On Windows, the installer resolves the real `go` and `gofmt` executables behind Scoop shims before invoking the toolchain.
+
 Pinned refs: CPA `v7.2.50` (default), Bifrost `main`.
 
 ## Advanced: non-interactive `.env` (`-UseEnv`)

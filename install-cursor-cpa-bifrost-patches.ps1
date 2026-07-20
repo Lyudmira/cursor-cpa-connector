@@ -10,6 +10,7 @@ param(
     [string]$BifrostPort = "127.0.0.1:8080:8080",
     [switch]$SkipCPA,
     [switch]$SkipBifrost,
+    [switch]$SkipBifrostBuild,
     [switch]$RestartCPA,
     [switch]$RestartBifrost,
     [string]$CPAConfig = "C:\CLIProxyAPI\config.yaml",
@@ -30,6 +31,18 @@ function Require-Command([string]$Name, [string]$Hint) {
     if (-not (Get-Command $Name -ErrorAction SilentlyContinue)) {
         throw "Missing command '$Name'. $Hint"
     }
+}
+
+function Resolve-RealCommandPath([string]$Name) {
+    $command = Get-Command $Name -CommandType Application -ErrorAction Stop | Select-Object -First 1
+    $path = $command.Source
+    if ($path -like "*\scoop\shims\*" -and (Get-Command scoop -ErrorAction SilentlyContinue)) {
+        $candidate = (& scoop which $Name | Select-Object -First 1)
+        if ($candidate) {
+            $path = (Resolve-Path -LiteralPath $candidate.Trim()).Path
+        }
+    }
+    return $path
 }
 
 function Reset-Directory([string]$Path) {
@@ -79,7 +92,7 @@ function Apply-CPA-Patch([string]$SourceRoot) {
             Copy-Item -Force $requestTestPatchFile $requestTestTarget
         }
     } else {
-    $content = Get-Content -Raw -LiteralPath $responsesRequest
+    $content = Get-Content -Raw -Encoding UTF8 -LiteralPath $responsesRequest
     if ($content -notmatch '"strings"') {
         $content = $content -replace '("fmt"\r?\n)', "`$1`t`"strings`"`r`n"
     }
@@ -334,7 +347,7 @@ func normalizeFunctionCallOutputContentTypes(itemRaw []byte) ([]byte, bool, erro
 
     $chatRequest = Join-Path $SourceRoot "internal\translator\codex\openai\chat-completions\codex_openai_request.go"
     if (Test-Path $chatRequest) {
-        $chatRequestContent = Get-Content -Raw -LiteralPath $chatRequest
+        $chatRequestContent = Get-Content -Raw -Encoding UTF8 -LiteralPath $chatRequest
         $chatRequestContent = $chatRequestContent -replace 'case "text":(\s*part := \[\]byte\(`\{\}`\)\s*part, _ = sjson\.SetBytes\(part, "type", "input_text"\))', 'case "text", "output_text":$1'
         Save-Utf8NoBom $chatRequest $chatRequestContent
     } else {
@@ -351,15 +364,15 @@ func normalizeFunctionCallOutputContentTypes(itemRaw []byte) ([]byte, bool, erro
 
     Push-Location $SourceRoot
     try {
-        gofmt -w $responsesRequest
-        if (Test-Path $chatRequest) { gofmt -w $chatRequest }
-        go test ./internal/translator/codex/openai/responses/...
-        go test ./internal/translator/codex/openai/chat-completions/...
+        & $script:GofmtExe -w $responsesRequest
+        if (Test-Path $chatRequest) { & $script:GofmtExe -w $chatRequest }
+        & $script:GoExe test ./internal/translator/codex/openai/responses/...
+        & $script:GoExe test ./internal/translator/codex/openai/chat-completions/...
         if ($LASTEXITCODE -ne 0) { throw "go test failed" }
 
         New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
         $outExe = Join-Path $OutputDir "cli-proxy-api-patched.exe"
-        go build -o $outExe ./cmd/server
+        & $script:GoExe build -o $outExe ./cmd/server
         if ($LASTEXITCODE -ne 0) { throw "CPA go build failed" }
         Write-Host "Built CPA: $outExe" -ForegroundColor Green
     } finally {
@@ -375,7 +388,7 @@ function Apply-Bifrost-Patch([string]$SourceRoot) {
         throw "Bifrost responses.go not found: $responsesGo"
     }
 
-    $content = Get-Content -Raw -LiteralPath $responsesGo
+    $content = Get-Content -Raw -Encoding UTF8 -LiteralPath $responsesGo
     $content = $content -replace 'Strict\s+\*bool\s+`json:"strict"`', 'Strict     *bool                   `json:"strict,omitempty"`'
     # Bifrost main briefly retained a write to the removed rawToolSearch field after
     # replacing it with rawPreserved. Remove only that stale assignment when the field
@@ -388,7 +401,7 @@ function Apply-Bifrost-Patch([string]$SourceRoot) {
     if (-not (Test-Path $muxGo)) {
         throw "Bifrost mux.go not found: $muxGo"
     }
-    $muxContent = Get-Content -Raw -LiteralPath $muxGo
+    $muxContent = Get-Content -Raw -Encoding UTF8 -LiteralPath $muxGo
     if ($muxContent -notmatch 'rt.CacheControl = ct.CacheControl') {
         $muxContent = $muxContent.Replace("`trt := &ResponsesTool{`r`n`t`tType: ResponsesToolType(ct.Type),`r`n`t}", "`trt := &ResponsesTool{`r`n`t`tType:         ResponsesToolType(ct.Type),`r`n`t`tCacheControl: ct.CacheControl,`r`n`t}")
     }
@@ -595,7 +608,7 @@ func addCursorClaudeToolCacheBreakpoint(req *openai.OpenAIResponsesRequest) {
         Save-Utf8NoBom $cursorGo $cursorContent
     }
 
-    $cursorContent = Get-Content -Raw -LiteralPath $cursorGo
+    $cursorContent = Get-Content -Raw -Encoding UTF8 -LiteralPath $cursorGo
     if ([regex]::Matches($cursorContent, 'addCursorClaudeToolCacheBreakpoint\(cursorReq\)').Count -ne 2) {
         throw "Expected Claude cache helper calls in both Cursor parser paths: $cursorGo"
     }
@@ -633,7 +646,7 @@ func addCursorClaudeToolCacheBreakpoint(req *openai.OpenAIResponsesRequest) {
     #     turn accumulate cache turn-over-turn), and the second-to-last *user*-role
     #     message (realigns across a full turn boundary, which typically appends more
     #     than the 1-2 items the absolute-position pair assumes).
-    $cursorContent = Get-Content -Raw -LiteralPath $cursorGo
+    $cursorContent = Get-Content -Raw -Encoding UTF8 -LiteralPath $cursorGo
     if ($cursorContent -notmatch "isClaudeCursorModel") {
         $finalUpgradePattern = '(?s)// addCursorClaudeToolCacheBreakpoint adds.*?(?=// normalizeInputContentBlocks ensures)'
         if ($cursorContent -notmatch $finalUpgradePattern) {
@@ -818,7 +831,7 @@ func addCursorClaudeSystemCacheBreakpoint(req *openai.OpenAIResponsesRequest) {
         Save-Utf8NoBom $cursorGo $cursorContent
     }
 
-    $cursorContent = Get-Content -Raw -LiteralPath $cursorGo
+    $cursorContent = Get-Content -Raw -Encoding UTF8 -LiteralPath $cursorGo
     if ([regex]::Matches($cursorContent, 'func addCursorClaudeSystemCacheBreakpoint').Count -ne 1) {
         throw "Expected exactly one Claude system cache breakpoint helper definition: $cursorGo"
     }
@@ -838,7 +851,7 @@ func addCursorClaudeSystemCacheBreakpoint(req *openai.OpenAIResponsesRequest) {
     if (-not (Test-Path $inferenceGo)) {
         throw "Bifrost inference handler not found: $inferenceGo"
     }
-    $inferenceContent = Get-Content -Raw -LiteralPath $inferenceGo
+    $inferenceContent = Get-Content -Raw -Encoding UTF8 -LiteralPath $inferenceGo
     if ($inferenceContent -notmatch 'ApplyCursorThinkingHighAlias') {
         $thinkingHighBlock = @'
 	if req.ResponsesParameters == nil {
@@ -859,11 +872,14 @@ func addCursorClaudeSystemCacheBreakpoint(req *openai.OpenAIResponsesRequest) {
         }
         $inferenceContent = [regex]::Replace($inferenceContent, $responsesParamsPattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $thinkingHighBlock.TrimEnd() }, 1)
 
-        $enrichCall = "`tenrichListModelsResponse(resp, h.config.ModelCatalog)"
-        $enrichWithAliases = "`tenrichListModelsResponse(resp, h.config.ModelCatalog)`r`n`tschemas.AppendCursorThinkingHighModels(resp)"
-        if (-not $inferenceContent.Contains($enrichCall)) {
+        $enrichCall = @(
+            "`tenrichAndFilterListModelsResponse(resp, h.config.ModelCatalog)",
+            "`tenrichListModelsResponse(resp, h.config.ModelCatalog)"
+        ) | Where-Object { $inferenceContent.Contains($_) } | Select-Object -First 1
+        if (-not $enrichCall) {
             throw "Could not locate /v1/models enrichment in $inferenceGo"
         }
+        $enrichWithAliases = "$enrichCall`r`n`tschemas.AppendCursorThinkingHighModels(resp)"
         $inferenceContent = $inferenceContent.Replace($enrichCall, $enrichWithAliases)
         Save-Utf8NoBom $inferenceGo $inferenceContent
     }
@@ -872,7 +888,7 @@ func addCursorClaudeSystemCacheBreakpoint(req *openai.OpenAIResponsesRequest) {
     if (-not (Test-Path $openAIIntegrationGo)) {
         throw "Bifrost OpenAI integration not found: $openAIIntegrationGo"
     }
-    $openAIIntegrationContent = Get-Content -Raw -LiteralPath $openAIIntegrationGo
+    $openAIIntegrationContent = Get-Content -Raw -Encoding UTF8 -LiteralPath $openAIIntegrationGo
     if ($openAIIntegrationContent -notmatch 'AppendCursorThinkingHighModels') {
         $cursorListModelsConverter = @'
 			ListModelsResponseConverter: func(ctx *schemas.BifrostContext, resp *schemas.BifrostListModelsResponse) (interface{}, error) {
@@ -899,11 +915,11 @@ func addCursorClaudeSystemCacheBreakpoint(req *openai.OpenAIResponsesRequest) {
 
     Push-Location $SourceRoot
     try {
-        gofmt -w $responsesGo $muxGo $cursorGo $thinkingHighGo $thinkingHighTest $inferenceGo $openAIIntegrationGo $schemaCompatTest $cursorCompatTest $thinkingHighHandlerTest
+        & $script:GofmtExe -w $responsesGo $muxGo $cursorGo $cursorToolResultsGo $thinkingHighGo $thinkingHighTest $inferenceGo $openAIIntegrationGo $schemaCompatTest $cursorCompatTest $thinkingHighHandlerTest
 
         Push-Location (Join-Path $SourceRoot "core")
         try {
-            go test ./schemas -run CursorConnector -count=1
+            & $script:GoExe test ./schemas -run CursorConnector -count=1
             if ($LASTEXITCODE -ne 0) { throw "Bifrost schema compatibility tests failed" }
         } finally {
             Pop-Location
@@ -912,15 +928,15 @@ func addCursorClaudeSystemCacheBreakpoint(req *openai.OpenAIResponsesRequest) {
         $goWork = Join-Path $SourceRoot "go.work"
         $createdGoWork = -not (Test-Path $goWork)
         if ($createdGoWork) {
-            go work init
-            go work use ./core ./framework ./plugins/compat ./plugins/governance ./plugins/jsonparser ./plugins/logging ./plugins/maxim ./plugins/mocker ./plugins/otel ./plugins/prompts ./plugins/semanticcache ./plugins/telemetry ./transports
+            & $script:GoExe work init
+            & $script:GoExe work use ./core ./framework ./plugins/compat ./plugins/governance ./plugins/jsonparser ./plugins/logging ./plugins/maxim ./plugins/mocker ./plugins/otel ./plugins/prompts ./plugins/semanticcache ./plugins/telemetry ./transports
             if ($LASTEXITCODE -ne 0) { throw "Bifrost go.work setup failed" }
         }
         Push-Location (Join-Path $SourceRoot "transports")
         try {
-            go test ./bifrost-http/integrations -run CursorConnector -count=1
+            & $script:GoExe test ./bifrost-http/integrations -run CursorConnector -count=1
             if ($LASTEXITCODE -ne 0) { throw "Bifrost Cursor compatibility tests failed" }
-            go test ./bifrost-http/handlers -run CursorConnector -count=1
+            & $script:GoExe test ./bifrost-http/handlers -run CursorConnector -count=1
             if ($LASTEXITCODE -ne 0) { throw "Bifrost thinking-high handler tests failed" }
         } finally {
             Pop-Location
@@ -931,10 +947,12 @@ func addCursorClaudeSystemCacheBreakpoint(req *openai.OpenAIResponsesRequest) {
             }
         }
 
-        $dockerfile = Join-Path $PSScriptRoot "Dockerfile.bifrost-patched"
-        docker build -f $dockerfile -t $BifrostImage --build-arg VERSION=local-patch .
-        if ($LASTEXITCODE -ne 0) { throw "Bifrost docker build failed" }
-        Write-Host "Built Bifrost image: $BifrostImage" -ForegroundColor Green
+        if (-not $SkipBifrostBuild) {
+            $dockerfile = Join-Path $PSScriptRoot "Dockerfile.bifrost-patched"
+            docker build -f $dockerfile -t $BifrostImage --build-arg VERSION=local-patch .
+            if ($LASTEXITCODE -ne 0) { throw "Bifrost docker build failed" }
+            Write-Host "Built Bifrost image: $BifrostImage" -ForegroundColor Green
+        }
     } finally {
         Pop-Location
     }
@@ -966,7 +984,9 @@ function Restart-Bifrost-Container {
 
 Require-Command git "Install Git for Windows."
 Require-Command go "Install Go."
-if (-not $SkipBifrost) {
+$script:GoExe = Resolve-RealCommandPath "go"
+$script:GofmtExe = Resolve-RealCommandPath "gofmt"
+if (-not $SkipBifrost -and -not $SkipBifrostBuild) {
     Require-Command docker "Install Docker Desktop and start it."
 }
 
