@@ -1,0 +1,45 @@
+services:
+  cpa:
+    image: cpa-patched:local
+    pull_policy: never
+    container_name: cpa
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8317:8317"
+    volumes:
+      - "${CPA_PROJECT_DIR:-C:/CLIProxyAPI}/config.docker.yaml:/CLIProxyAPI/config.yaml:ro"
+      - "${CPA_PROJECT_DIR:-C:/CLIProxyAPI}/auths:/CLIProxyAPI/auths"
+      - "${CPA_PROJECT_DIR:-C:/CLIProxyAPI}/logs:/CLIProxyAPI/logs"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8317/ || exit 1"]
+      interval: 10s
+      timeout: 3s
+      start_period: 10s
+      retries: 6
+
+  bifrost:
+    image: bifrost-patched:local
+    pull_policy: never
+    container_name: bifrost
+    restart: unless-stopped
+    depends_on:
+      cpa:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      APP_PORT: "8080"
+      APP_HOST: "0.0.0.0"
+      LOG_LEVEL: "info"
+      LOG_STYLE: "json"
+      APP_DIR: "/app/data"
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - "${BIFROST_DATA_DIR:-C:/bifrost/data}:/app/data"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 5s
+      retries: 3

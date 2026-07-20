@@ -44,6 +44,7 @@ $dockerfile = 'C:\CLIProxyAPI\Dockerfile.cpa-patched'
 $configDocker = 'C:\CLIProxyAPI\config.docker.yaml'
 $authsDir = 'C:\CLIProxyAPI\auths'
 $logsDir = 'C:\CLIProxyAPI\logs'
+$composeFile = 'C:\CLIProxyAPI\docker-compose.autostart.yml'
 $image = 'cpa-patched:local'
 $container = 'cpa'
 
@@ -57,19 +58,24 @@ Write-Host "Building $image from $src ..."
 docker build -f $dockerfile -t $image --build-arg VERSION=v7.2.50-patched "$src"
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-Write-Host "Stopping old $container container..."
-docker stop $container 2>$null
-docker rm $container 2>$null
+if (Test-Path -LiteralPath $composeFile) {
+    Write-Host "Recreating $container through the autostart compose stack..."
+    docker compose -f $composeFile up -d --force-recreate $container
+} else {
+    Write-Host "Stopping old $container container..."
+    docker stop $container 2>$null
+    docker rm $container 2>$null
 
-Write-Host "Starting patched $container container..."
-docker run -d `
-    --name $container `
-    --restart unless-stopped `
-    -p 127.0.0.1:8317:8317 `
-    -v "${configDocker}:/CLIProxyAPI/config.yaml:ro" `
-    -v "${authsDir}:/CLIProxyAPI/auths" `
-    -v "${logsDir}:/CLIProxyAPI/logs" `
-    $image
+    Write-Host "Starting patched $container container..."
+    docker run -d `
+        --name $container `
+        --restart unless-stopped `
+        -p 127.0.0.1:8317:8317 `
+        -v "${configDocker}:/CLIProxyAPI/config.yaml:ro" `
+        -v "${authsDir}:/CLIProxyAPI/auths" `
+        -v "${logsDir}:/CLIProxyAPI/logs" `
+        $image
+}
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Host "Waiting for cpa to come up..."

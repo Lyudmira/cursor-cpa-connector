@@ -84,6 +84,17 @@ Use `-SkipBifrostBuild` to apply and test the Bifrost source patches without bui
 
 Pinned refs: CPA `v7.2.50` (default), Bifrost `main`.
 
+### Optional Docker Compose autostart
+
+The public compose example contains only the patched CPA and Bifrost services and uses the local image names produced by this kit. Copy it to the path used by the Windows CPA build script:
+
+```powershell
+Copy-Item .\docker-compose.autostart.yml.example C:\CLIProxyAPI\docker-compose.autostart.yml
+docker compose -f C:\CLIProxyAPI\docker-compose.autostart.yml up -d
+```
+
+The defaults expect CPA under `C:\CLIProxyAPI` and Bifrost data under `C:\bifrost\data`. Set `CPA_PROJECT_DIR` or `BIFROST_DATA_DIR` in the Compose environment to override them. Once the file exists, `build-patched-cpa.ps1` recreates the `cpa` service through this compose stack after rebuilding the image; without it, the script retains its standalone `docker run` fallback.
+
 ## Advanced: non-interactive `.env` (`-UseEnv`)
 
 Only if you explicitly opt in. Copy `.env.example` to `.env`, then:
@@ -206,6 +217,7 @@ Restart Codex / reload the extension once after creating or changing `managed_co
 | `bifrost_cursortoolresults.go` | Cursor/Bifrost tool-result reconciliation helper copied into the Bifrost integration package |
 | `Dockerfile.bifrost-patched` | Patched Bifrost image build recipe |
 | `Dockerfile.cpa-patched` | Patched CPA image build recipe (Linux binary, same patched source as the `.exe`) |
+| `docker-compose.autostart.yml.example` | Sanitized CPA+Bifrost compose stack using the local patched images and configurable host paths |
 | `build-patched-cpa.ps1` | Windows/PowerShell: patch + test + build CPA `.exe` and native debug binary, then build `cpa-patched:local` and redeploy the `cpa` container (`--restart unless-stopped`) |
 | `build-patched-cpa.sh` | bash equivalent of the above (git-bash or real Linux/macOS); paths overridable via `CPA_SRC` / `CPA_PROJECT_DIR` / etc. env vars |
 | `config.docker.yaml.example` | Sanitized template for the CPA config the `cpa` container reads (`auth-dir` rewritten to the container path); copy to `config.docker.yaml` (gitignored) and fill in real `api-keys` / `remote-management.secret-key` |
