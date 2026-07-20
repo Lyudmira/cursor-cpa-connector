@@ -367,8 +367,9 @@ func normalizeFunctionCallOutputContentTypes(itemRaw []byte) ([]byte, bool, erro
         & $script:GofmtExe -w $responsesRequest
         if (Test-Path $chatRequest) { & $script:GofmtExe -w $chatRequest }
         & $script:GoExe test ./internal/translator/codex/openai/responses/...
+        if ($LASTEXITCODE -ne 0) { throw "CPA Responses tests failed" }
         & $script:GoExe test ./internal/translator/codex/openai/chat-completions/...
-        if ($LASTEXITCODE -ne 0) { throw "go test failed" }
+        if ($LASTEXITCODE -ne 0) { throw "CPA Chat Completions tests failed" }
 
         New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
         $outExe = Join-Path $OutputDir "cli-proxy-api-patched.exe"

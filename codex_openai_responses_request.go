@@ -66,6 +66,50 @@ func applyResponsesCompactionCompatibility(rawJSON []byte) []byte {
 	return rawJSON
 }
 
+// convertSystemRoleToDeveloper retains the helper expected by the pinned
+// CLIProxyAPI v7.2.50 test suite. The broader Cursor sanitizer below supersedes
+// it in production, but this compatibility helper intentionally preserves the
+// original role-only behavior used by upstream tests and benchmarks.
+func convertSystemRoleToDeveloper(rawJSON []byte) []byte {
+	inputResult := gjson.GetBytes(rawJSON, "input")
+	if !inputResult.IsArray() {
+		return rawJSON
+	}
+
+	inputItems := inputResult.Array()
+	if len(inputItems) == 0 {
+		return rawJSON
+	}
+
+	changed := false
+	rebuiltInput := make([]json.RawMessage, 0, len(inputItems))
+	for _, item := range inputItems {
+		itemRaw := []byte(item.Raw)
+		if item.IsObject() && item.Get("role").String() == "system" {
+			updatedItem, err := sjson.SetBytes(itemRaw, "role", "developer")
+			if err != nil {
+				return rawJSON
+			}
+			itemRaw = updatedItem
+			changed = true
+		}
+		rebuiltInput = append(rebuiltInput, json.RawMessage(itemRaw))
+	}
+	if !changed {
+		return rawJSON
+	}
+
+	inputRaw, err := json.Marshal(rebuiltInput)
+	if err != nil {
+		return rawJSON
+	}
+	updated, err := sjson.SetRawBytes(rawJSON, "input", inputRaw)
+	if err != nil {
+		return rawJSON
+	}
+	return updated
+}
+
 // sanitizeCodexResponsesInputItems traverses the input array and normalizes item
 // fields to the narrower schema accepted by Codex upstream.
 //

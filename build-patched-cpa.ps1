@@ -27,9 +27,13 @@ $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 Push-Location $src
 try {
     gofmt -w $chatRequestTarget
+    if ($LASTEXITCODE -ne 0) { throw "gofmt failed" }
     go test ./internal/translator/codex/openai/chat-completions/...
+    if ($LASTEXITCODE -ne 0) { throw "CPA Chat Completions tests failed" }
     go test ./internal/translator/codex/openai/responses/...
+    if ($LASTEXITCODE -ne 0) { throw "CPA Responses tests failed" }
     go build -o $outExe ./cmd/server
+    if ($LASTEXITCODE -ne 0) { throw "CPA build failed" }
 } finally {
     Pop-Location
 }
