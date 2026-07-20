@@ -6,6 +6,8 @@ $chatResponsePatch = 'C:\cliproxyapi\patches\codex_openai_response.go'
 $chatResponseTarget = Join-Path $src 'internal\translator\codex\openai\chat-completions\codex_openai_response.go'
 $responsesRequestPatch = 'C:\cliproxyapi\patches\codex_openai_responses_request.go'
 $responsesRequestTarget = Join-Path $src 'internal\translator\codex\openai\responses\codex_openai-responses_request.go'
+$responsesRequestTestPatch = 'C:\cliproxyapi\patches\codex_openai_responses_request_image_test.go'
+$responsesRequestTestTarget = Join-Path $src 'internal\translator\codex\openai\responses\codex_openai-responses_request_image_test.go'
 $chatRequestTarget = Join-Path $src 'internal\translator\codex\openai\chat-completions\codex_openai_request.go'
 $outDir = 'C:\cliproxyapi'
 $outExe = Join-Path $outDir 'cli-proxy-api-patched.exe'
@@ -16,6 +18,7 @@ if (-not (Test-Path $src)) {
 
 Copy-Item -Force $chatResponsePatch $chatResponseTarget
 Copy-Item -Force $responsesRequestPatch $responsesRequestTarget
+Copy-Item -Force $responsesRequestTestPatch $responsesRequestTestTarget
 $chatRequestContent = Get-Content -Raw -LiteralPath $chatRequestTarget
 $chatRequestContent = $chatRequestContent -replace 'case "text":(\s*part := \[\]byte\(`\{\}`\)\s*part, _ = sjson\.SetBytes\(part, "type", "input_text"\))', 'case "text", "output_text":$1'
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)

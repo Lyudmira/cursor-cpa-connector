@@ -338,12 +338,39 @@ func normalizeFunctionCallOutputContentTypes(itemRaw []byte) ([]byte, bool, erro
 			continue
 		}
 		outputType := outputItem.Get("type").String()
-		if outputType != "text" && outputType != "output_text" {
+		normalizedType := ""
+		switch outputType {
+		case "text", "output_text":
+			normalizedType = "input_text"
+		case "image_url":
+			imageURL := outputItem.Get("image_url")
+			if imageURL.IsObject() {
+				url := imageURL.Get("url")
+				if url.Type != gjson.String {
+					continue
+				}
+
+				var err error
+				updated, err = sjson.SetBytes(updated, fmt.Sprintf("output.%d.image_url", i), url.String())
+				if err != nil {
+					return itemRaw, false, err
+				}
+				if detail := imageURL.Get("detail"); detail.Type == gjson.String {
+					updated, err = sjson.SetBytes(updated, fmt.Sprintf("output.%d.detail", i), detail.String())
+					if err != nil {
+						return itemRaw, false, err
+					}
+				}
+			} else if imageURL.Type != gjson.String {
+				continue
+			}
+			normalizedType = "input_image"
+		default:
 			continue
 		}
 
 		var err error
-		updated, err = sjson.SetBytes(updated, fmt.Sprintf("output.%d.type", i), "input_text")
+		updated, err = sjson.SetBytes(updated, fmt.Sprintf("output.%d.type", i), normalizedType)
 		if err != nil {
 			return itemRaw, false, err
 		}
