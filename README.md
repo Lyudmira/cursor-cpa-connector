@@ -69,6 +69,7 @@ Regex patch on `core/schemas/responses.go` (via the install script):
 - `ResponsesToolTypeFunction`: fallback to `raw["function"]` and `raw["input_schema"]`.
 - `Strict *bool` json tag gets `omitempty`.
 - Cursor `function_call_output.output[]` content aliases `text` / `output_text` are normalized to `input_text` before provider forwarding.
+- Cursor tool results carried only in the parallel `messages` representation are reconciled into incomplete `input` history by call ID. Existing non-empty `input` results remain authoritative, missing results are inserted once after their matching calls, and orphan results are ignored.
 - Claude Cursor requests receive up to 4 `cache_control: {"type":"ephemeral"}` breakpoints (Anthropic's per-request max), all message-level, when the client did not provide an explicit cache policy: a stable anchor (system/developer message, or the first message when Cursor sends none — see below), the absolute last message, the absolute second-to-last message, and the second-to-last *user*-role message. No tool-level breakpoint is set. See "Claude prompt caching" below and `docs/major_fix/` for the full investigation and why each of these is needed.
 
 ## Install mechanism
@@ -200,6 +201,7 @@ Restart Codex / reload the extension once after creating or changing `managed_co
 | `.env.example` | Template for `-UseEnv` only |
 | `codex_openai_responses_request.go` | Full Responses **request** translator patch |
 | `codex_openai_response.go` | Chat-completions response patch (PR #4079) |
+| `bifrost_cursortoolresults.go` | Cursor/Bifrost tool-result reconciliation helper copied into the Bifrost integration package |
 | `Dockerfile.bifrost-patched` | Patched Bifrost image build recipe |
 | `Dockerfile.cpa-patched` | Patched CPA image build recipe (Linux binary, same patched source as the `.exe`) |
 | `build-patched-cpa.ps1` | Windows/PowerShell: patch + test + build CPA `.exe` and native debug binary, then build `cpa-patched:local` and redeploy the `cpa` container (`--restart unless-stopped`) |

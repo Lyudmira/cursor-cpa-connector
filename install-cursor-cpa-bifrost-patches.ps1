@@ -497,10 +497,11 @@ case ResponsesToolTypeFunction:
         throw "Bifrost Cursor integration not found: $cursorGo"
     }
 
-    $cursorContent = Get-Content -Raw -LiteralPath $cursorGo
-    if ($cursorContent -notmatch "normalizeCursorFunctionCallOutputs") {
-        $cursorContent = $cursorContent -replace 'cursorMergeToolResultsFromMessages\(data, cursorReq\)\r?\n\s*normalizeInputContentBlocks\(cursorReq\)', "cursorMergeToolResultsFromMessages(data, cursorReq)`r`n`t`tnormalizeCursorFunctionCallOutputs(cursorReq)`r`n`t`tnormalizeInputContentBlocks(cursorReq)"
+    $cursorToolResultsGo = Join-Path $SourceRoot "transports\bifrost-http\integrations\cursortoolresults.go"
+    Copy-Item -Force (Join-Path $PSScriptRoot "bifrost_cursortoolresults.go") $cursorToolResultsGo
 
+    $cursorContent = Get-Content -Raw -Encoding UTF8 -LiteralPath $cursorGo
+    if ($cursorContent -notmatch "normalizeCursorFunctionCallOutputs") {
         $normalizeMarker = '// normalizeInputContentBlocks ensures all input messages have ContentBlocks instead of'
         $normalizeFunction = @"
 // normalizeCursorFunctionCallOutputs rewrites Cursor's non-standard text aliases
@@ -525,10 +526,36 @@ func normalizeCursorFunctionCallOutputs(req *openai.OpenAIResponsesRequest) {
             throw "Could not locate Cursor input normalization marker in $cursorGo"
         }
         $cursorContent = $cursorContent.Replace($normalizeMarker, $normalizeFunction + $normalizeMarker)
-        Save-Utf8NoBom $cursorGo $cursorContent
     }
 
-    $cursorContent = Get-Content -Raw -LiteralPath $cursorGo
+    $mergeThenNormalizePattern = 'cursorMergeToolResultsFromMessages\(data, cursorReq\)\r?\n(\s*)normalizeInputContentBlocks\(cursorReq\)'
+    $cursorContent = [regex]::Replace($cursorContent, $mergeThenNormalizePattern, [System.Text.RegularExpressions.MatchEvaluator]{
+        param($m)
+        "cursorMergeToolResultsFromMessages(data, cursorReq)`r`n$($m.Groups[1].Value)normalizeCursorFunctionCallOutputs(cursorReq)`r`n$($m.Groups[1].Value)normalizeInputContentBlocks(cursorReq)"
+    })
+
+    $mergeFunctionPattern = '(?s)func cursorMergeToolResultsFromMessages\(data \[\]byte, cursorReq \*openai\.OpenAIResponsesRequest\) \{.*?\r?\n\}\r?\n\s*(?=// cursorConvertMessagesToInput)'
+    if ($cursorContent -notmatch $mergeFunctionPattern) {
+        throw "Could not locate Cursor tool-result merge function in $cursorGo"
+    }
+    $mergeDelegate = @'
+func cursorMergeToolResultsFromMessages(data []byte, cursorReq *openai.OpenAIResponsesRequest) {
+	reconcileCursorToolResultsFromMessages(data, cursorReq)
+}
+
+'@
+    $cursorContent = [regex]::Replace($cursorContent, $mergeFunctionPattern, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $mergeDelegate }, 1)
+    Save-Utf8NoBom $cursorGo $cursorContent
+
+    $cursorContent = Get-Content -Raw -Encoding UTF8 -LiteralPath $cursorGo
+    if ([regex]::Matches($cursorContent, 'normalizeCursorFunctionCallOutputs\(cursorReq\)').Count -ne 2) {
+        throw "Expected Cursor tool-output normalization in both parser paths: $cursorGo"
+    }
+    if ([regex]::Matches($cursorContent, 'reconcileCursorToolResultsFromMessages\(data, cursorReq\)').Count -ne 1) {
+        throw "Expected exactly one Cursor tool-result reconciliation delegate: $cursorGo"
+    }
+
+    $cursorContent = Get-Content -Raw -Encoding UTF8 -LiteralPath $cursorGo
     if ($cursorContent -notmatch "addCursorClaudeToolCacheBreakpoint") {
         $happyPathPattern = 'normalizeInputContentBlocks\(cursorReq\)\r?\n\s*return nil'
         if ($cursorContent -notmatch $happyPathPattern) {

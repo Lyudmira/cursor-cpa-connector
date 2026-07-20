@@ -1,8 +1,10 @@
 package integrations
 
 import (
+	"fmt"
 	"github.com/maximhq/bifrost/core/providers/openai"
 	"github.com/maximhq/bifrost/core/schemas"
+	"github.com/valyala/fasthttp"
 	"testing"
 )
 
@@ -248,5 +250,178 @@ func TestCursorConnectorNormalizesToolOutputs(t *testing.T) {
 		if got := req.Input.OpenAIResponsesRequestInputArray[0].Output.ResponsesFunctionToolCallOutputBlocks[0].Type; got != schemas.ResponsesInputMessageContentBlockTypeText {
 			t.Fatalf("alias %q became %q", alias, got)
 		}
+	}
+}
+
+func parseCursorConnectorRequest(t *testing.T, raw string) *openai.OpenAIResponsesRequest {
+	t.Helper()
+	ctx := &fasthttp.RequestCtx{}
+	ctx.Request.SetBodyString(raw)
+	req := &openai.OpenAIResponsesRequest{}
+	if err := cursorRequestParser(ctx, req); err != nil {
+		t.Fatalf("cursorRequestParser: %v", err)
+	}
+	return req
+}
+
+func cursorConnectorOutputByCallID(t *testing.T, req *openai.OpenAIResponsesRequest, callID string) *schemas.ResponsesMessage {
+	t.Helper()
+	for i := range req.Input.OpenAIResponsesRequestInputArray {
+		msg := &req.Input.OpenAIResponsesRequestInputArray[i]
+		if got, ok := cursorFunctionCallOutputID(msg); ok && got == callID {
+			return msg
+		}
+	}
+	t.Fatalf("function_call_output %q not found", callID)
+	return nil
+}
+
+func cursorConnectorOutputText(msg *schemas.ResponsesMessage) string {
+	if msg == nil || msg.ResponsesToolMessage == nil || msg.Output == nil {
+		return ""
+	}
+	if msg.Output.ResponsesToolCallOutputStr != nil {
+		return *msg.Output.ResponsesToolCallOutputStr
+	}
+	for _, block := range msg.Output.ResponsesFunctionToolCallOutputBlocks {
+		if block.Text != nil {
+			return *block.Text
+		}
+	}
+	return ""
+}
+
+func TestCursorConnectorReconcilesEmptyInputToolResults(t *testing.T) {
+	for _, toolName := range []string{"Read", "SearchFiles", "Shell"} {
+		t.Run(toolName, func(t *testing.T) {
+			callID := "call_" + toolName
+			raw := fmt.Sprintf(`{
+				"model":"claude-sonnet-5",
+				"input":[
+					{"type":"message","role":"user","content":[{"type":"input_text","text":"use the tool"}]},
+					{"type":"function_call","role":"assistant","call_id":%q,"name":%q,"arguments":"{}"},
+					{"type":"function_call_output","call_id":%q,"output":""}
+				],
+				"messages":[
+					{"role":"user","content":"use the tool"},
+					{"role":"assistant","content":[{"type":"tool_use","id":%q,"name":%q,"input":{}}]},
+					{"role":"user","content":[{"type":"tool_result","tool_use_id":%q,"content":[{"type":"text","text":"MARKER_%s"}]}]}
+				],
+				"tools":[{"name":%q,"description":"tool","input_schema":{"type":"object","properties":{}}}]
+			}`, callID, toolName, callID, callID, toolName, callID, toolName, toolName)
+			req := parseCursorConnectorRequest(t, raw)
+			got := cursorConnectorOutputText(cursorConnectorOutputByCallID(t, req, callID))
+			if want := "MARKER_" + toolName; got != want {
+				t.Fatalf("output = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestCursorConnectorReconcilesParallelResultsWithoutOverwritingValidInput(t *testing.T) {
+	raw := `{
+		"model":"claude-sonnet-5",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"parallel"}]},
+			{"type":"function_call","call_id":"call_read","name":"Read","arguments":"{}"},
+			{"type":"function_call","call_id":"call_search","name":"SearchFiles","arguments":"{}"},
+			{"type":"function_call_output","call_id":"call_read","output":"INPUT_WINS"},
+			{"type":"function_call_output","call_id":"call_search","output":[]}
+		],
+		"messages":[
+			{"role":"user","content":"parallel"},
+			{"role":"assistant","content":[
+				{"type":"tool_use","id":"call_read","name":"Read","input":{}},
+				{"type":"tool_use","id":"call_search","name":"SearchFiles","input":{}}
+			]},
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"call_read","content":"MESSAGES_MUST_NOT_WIN"},
+				{"type":"tool_result","tool_use_id":"call_search","content":"SEARCH_FILLED"}
+			]}
+		],
+		"tools":[{"name":"Read","input_schema":{"type":"object"}},{"name":"SearchFiles","input_schema":{"type":"object"}}]
+	}`
+	req := parseCursorConnectorRequest(t, raw)
+	if got := cursorConnectorOutputText(cursorConnectorOutputByCallID(t, req, "call_read")); got != "INPUT_WINS" {
+		t.Fatalf("valid input output was overwritten: %q", got)
+	}
+	if got := cursorConnectorOutputText(cursorConnectorOutputByCallID(t, req, "call_search")); got != "SEARCH_FILLED" {
+		t.Fatalf("empty parallel output was not filled: %q", got)
+	}
+}
+
+func TestCursorConnectorInsertsMissingResultOnceAndIgnoresOrphan(t *testing.T) {
+	raw := `{
+		"model":"claude-sonnet-5",
+		"input":[
+			{"type":"message","role":"user","content":[{"type":"input_text","text":"missing"}]},
+			{"type":"function_call","call_id":"call_read","name":"Read","arguments":"{}"},
+			{"type":"message","role":"assistant","content":[{"type":"output_text","text":"after"}]}
+		],
+		"messages":[
+			{"role":"user","content":"missing"},
+			{"role":"assistant","content":[{"type":"tool_use","id":"call_read","name":"Read","input":{}}]},
+			{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"call_read","content":"INSERTED"},
+				{"type":"tool_result","tool_use_id":"call_orphan","content":"ORPHAN"}
+			]}
+		],
+		"tools":[{"name":"Read","input_schema":{"type":"object"}}]
+	}`
+	req := parseCursorConnectorRequest(t, raw)
+	count := 0
+	for i := range req.Input.OpenAIResponsesRequestInputArray {
+		if callID, ok := cursorFunctionCallOutputID(&req.Input.OpenAIResponsesRequestInputArray[i]); ok {
+			if callID == "call_orphan" {
+				t.Fatal("orphan tool result was injected")
+			}
+			if callID == "call_read" {
+				count++
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("inserted result count = %d, want 1", count)
+	}
+	if got := cursorConnectorOutputText(cursorConnectorOutputByCallID(t, req, "call_read")); got != "INSERTED" {
+		t.Fatalf("inserted output = %q", got)
+	}
+}
+
+func TestCursorConnectorPreservesLegitimateEmptyAndErrorResults(t *testing.T) {
+	emptyType := schemas.ResponsesMessageTypeFunctionCallOutput
+	empty := ""
+	errText := "permission denied"
+	req := &openai.OpenAIResponsesRequest{Input: openai.OpenAIResponsesRequestInput{
+		OpenAIResponsesRequestInputArray: []schemas.ResponsesMessage{
+			{Type: &emptyType, ResponsesToolMessage: &schemas.ResponsesToolMessage{CallID: schemas.Ptr("call_empty"), Output: &schemas.ResponsesToolMessageOutputStruct{ResponsesToolCallOutputStr: &empty}}},
+			{Type: &emptyType, ResponsesToolMessage: &schemas.ResponsesToolMessage{CallID: schemas.Ptr("call_error"), Error: &errText}},
+		},
+	}}
+	if cursorFunctionCallOutputHasPayload(&req.Input.OpenAIResponsesRequestInputArray[0]) {
+		t.Fatal("empty result was treated as non-empty")
+	}
+	if !cursorFunctionCallOutputHasPayload(&req.Input.OpenAIResponsesRequestInputArray[1]) {
+		t.Fatal("error result was treated as empty")
+	}
+}
+
+func TestCursorConnectorNormalizesToolOutputsInBothParserPaths(t *testing.T) {
+	toolShapes := []string{
+		`{"type":"function","name":"Read","parameters":{"type":"object"}}`,
+		`{"name":"Read","input_schema":{"type":"object"}}`,
+	}
+	for i, tool := range toolShapes {
+		t.Run(fmt.Sprintf("path_%d", i), func(t *testing.T) {
+			raw := fmt.Sprintf(`{"model":"claude-sonnet-5","input":[{"type":"function_call_output","call_id":"call_read","output":[{"type":"text","text":"ok"}]}],"tools":[%s]}`, tool)
+			req := parseCursorConnectorRequest(t, raw)
+			msg := cursorConnectorOutputByCallID(t, req, "call_read")
+			if msg.Output == nil || len(msg.Output.ResponsesFunctionToolCallOutputBlocks) != 1 {
+				t.Fatalf("unexpected output: %#v", msg.Output)
+			}
+			if got := msg.Output.ResponsesFunctionToolCallOutputBlocks[0].Type; got != schemas.ResponsesInputMessageContentBlockTypeText {
+				t.Fatalf("output type = %q, want input_text", got)
+			}
+		})
 	}
 }
