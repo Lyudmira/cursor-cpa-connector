@@ -622,7 +622,7 @@ func addCursorClaudeToolCacheBreakpoint(req *openai.OpenAIResponsesRequest) {
     $compressionCallPattern = 'normalizeInputContentBlocks\(cursorReq\)\r?\n(\s*)addCursorClaudeToolCacheBreakpoint\(cursorReq\)'
     $cursorContent = [regex]::Replace($cursorContent, $compressionCallPattern, [System.Text.RegularExpressions.MatchEvaluator]{
         param($m)
-        "normalizeInputContentBlocks(cursorReq)`r`n$($m.Groups[1].Value)compressCursorClaudeRequest(cursorReq)`r`n$($m.Groups[1].Value)addCursorClaudeToolCacheBreakpoint(cursorReq)"
+        "normalizeInputContentBlocks(cursorReq)`r`n$($m.Groups[1].Value)if err := compressCursorClaudeRequest(cursorReq); err != nil {`r`n$($m.Groups[1].Value)`treturn err`r`n$($m.Groups[1].Value)}`r`n$($m.Groups[1].Value)addCursorClaudeToolCacheBreakpoint(cursorReq)"
     })
     Save-Utf8NoBom $cursorGo $cursorContent
     if ([regex]::Matches($cursorContent, 'compressCursorClaudeRequest\(cursorReq\)').Count -ne 2) {

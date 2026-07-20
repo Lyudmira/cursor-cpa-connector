@@ -5,7 +5,9 @@ services:
       context: ./image-compressor
     expose: ["47822"]
   bifrost-canary:
-    image: bifrost-patched:image-compression-20260720
+    image: bifrost-patched:image-compression-20260720-strict
+    entrypoint: ["/app/docker-entrypoint.sh"]
+    command: ["/app/main"]
     build:
       context: C:/Users/SurfacePro8/AppData/Local/Temp/cursor-cpa-connector/bifrost-src
       dockerfile: Dockerfile.cursor-patched
@@ -15,7 +17,7 @@ services:
       APP_PORT: "8080"
       APP_HOST: "0.0.0.0"
       APP_DIR: "/app/data"
-      CURSOR_CLAUDE_IMAGE_COMPRESSION: "shadow"
+      CURSOR_CLAUDE_IMAGE_COMPRESSION: "on"
       CURSOR_CLAUDE_IMAGE_COMPRESSOR_URL: "http://cursor-image-compressor-canary:47822/compress"
       CURSOR_CLAUDE_IMAGE_COMPRESSION_STATIC: "on"
       CURSOR_CLAUDE_IMAGE_COMPRESSION_TOOL_RESULTS: "on"

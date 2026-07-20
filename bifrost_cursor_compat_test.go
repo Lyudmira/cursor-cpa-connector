@@ -453,3 +453,28 @@ func TestCursorConnectorCompressionRunsBeforeCacheBreakpoints(t *testing.T) {
 		t.Fatalf("compression must run before cache marking: compress=%d cache=%d", compress, cache)
 	}
 }
+
+func TestCursorConnectorCompressionOnFailsClosedAndClearsFallbacks(t *testing.T) {
+	t.Setenv("CURSOR_CLAUDE_IMAGE_COMPRESSION", "on")
+	t.Setenv("CURSOR_CLAUDE_IMAGE_COMPRESSOR_URL", "http://127.0.0.1:1/compress")
+	req := &openai.OpenAIResponsesRequest{Model: "claude-sonnet-5", Fallbacks: []string{"claude-haiku-4-5"}}
+	err := compressCursorClaudeRequest(req)
+	if err == nil || !strings.Contains(err.Error(), "compressor request") {
+		t.Fatalf("expected explicit compressor request error, got %v", err)
+	}
+	if len(req.Fallbacks) != 0 {
+		t.Fatalf("strict compression must clear model fallbacks, got %v", req.Fallbacks)
+	}
+}
+
+func TestCursorConnectorCompressionShadowKeepsFallbacksOnCompressorFailure(t *testing.T) {
+	t.Setenv("CURSOR_CLAUDE_IMAGE_COMPRESSION", "shadow")
+	t.Setenv("CURSOR_CLAUDE_IMAGE_COMPRESSOR_URL", "http://127.0.0.1:1/compress")
+	req := &openai.OpenAIResponsesRequest{Model: "claude-sonnet-5", Fallbacks: []string{"claude-haiku-4-5"}}
+	if err := compressCursorClaudeRequest(req); err != nil {
+		t.Fatalf("shadow mode must remain diagnostic-only: %v", err)
+	}
+	if len(req.Fallbacks) != 1 {
+		t.Fatalf("shadow mode unexpectedly changed fallbacks: %v", req.Fallbacks)
+	}
+}
