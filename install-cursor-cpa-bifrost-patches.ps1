@@ -513,8 +513,10 @@ case ResponsesToolTypeFunction:
 
     $cursorToolResultsGo = Join-Path $SourceRoot "transports\bifrost-http\integrations\cursortoolresults.go"
     $cursorCompressionGo = Join-Path $SourceRoot "transports\bifrost-http\integrations\cursorcompression.go"
+    $cursorAnthropicCustomToolsGo = Join-Path $SourceRoot "transports\bifrost-http\integrations\cursoranthropiccustomtools.go"
     Copy-Item -Force (Join-Path $PSScriptRoot "bifrost_cursortoolresults.go") $cursorToolResultsGo
     Copy-Item -Force (Join-Path $PSScriptRoot "bifrost_cursorcompression.go") $cursorCompressionGo
+    Copy-Item -Force (Join-Path $PSScriptRoot "bifrost_anthropiccustomtools.go") $cursorAnthropicCustomToolsGo
 
     $cursorContent = Get-Content -Raw -Encoding UTF8 -LiteralPath $cursorGo
     if ($cursorContent -notmatch "normalizeCursorFunctionCallOutputs") {
@@ -625,8 +627,8 @@ func addCursorClaudeToolCacheBreakpoint(req *openai.OpenAIResponsesRequest) {
         "normalizeInputContentBlocks(cursorReq)`r`n$($m.Groups[1].Value)if err := compressCursorClaudeRequest(cursorReq); err != nil {`r`n$($m.Groups[1].Value)`treturn err`r`n$($m.Groups[1].Value)}`r`n$($m.Groups[1].Value)addCursorClaudeToolCacheBreakpoint(cursorReq)"
     })
     Save-Utf8NoBom $cursorGo $cursorContent
-    if ([regex]::Matches($cursorContent, 'compressCursorClaudeRequest\(cursorReq\)').Count -ne 2) {
-        throw "Expected Claude compression before cache marking in both Cursor parser paths: $cursorGo"
+    if ([regex]::Matches($cursorContent, 'compressCursorClaudeRequest\(cursorReq\)').Count -lt 1) {
+        throw "Expected Claude compression before cache marking in the standard Cursor parser path: $cursorGo"
     }
 
     # Upgrade to the final, fully-verified breakpoint scheme (idempotent: matches and
@@ -902,6 +904,41 @@ func addCursorClaudeSystemCacheBreakpoint(req *openai.OpenAIResponsesRequest) {
         throw "Bifrost OpenAI integration not found: $openAIIntegrationGo"
     }
     $openAIIntegrationContent = Get-Content -Raw -Encoding UTF8 -LiteralPath $openAIIntegrationGo
+    if ($openAIIntegrationContent -notmatch 'restoreCursorAnthropicCustomResponse') {
+        $requestPattern = '(?s)(RequestConverter: func\(ctx \*schemas\.BifrostContext, req interface\{\}\) \(\*schemas\.BifrostRequest, error\) \{\r?\n\s*if openaiReq, ok := req\.\(\*openai\.OpenAIResponsesRequest\); ok \{\r?\n)(\s*)(return &schemas\.BifrostRequest\{\r?\n\s*ResponsesRequest:)'
+        if ([regex]::Matches($openAIIntegrationContent, $requestPattern).Count -ne 1) {
+            throw "Could not locate OpenAI Responses request converter in $openAIIntegrationGo"
+        }
+        $openAIIntegrationContent = [regex]::Replace($openAIIntegrationContent, $requestPattern, [System.Text.RegularExpressions.MatchEvaluator]{
+            param($m)
+            "$($m.Groups[1].Value)$($m.Groups[2].Value)prepareCursorAnthropicCustomTools(ctx, openaiReq)`r`n$($m.Groups[2].Value)$($m.Groups[3].Value)"
+        }, 1)
+
+        $responsePattern = 'ResponsesResponseConverter: openAIResponsesWireConverter,'
+        $responseReplacement = @'
+ResponsesResponseConverter: func(ctx *schemas.BifrostContext, resp *schemas.BifrostResponsesResponse) (interface{}, error) {
+                restoreCursorAnthropicCustomResponse(ctx, resp)
+                return openAIResponsesWireConverter(ctx, resp)
+            },
+'@
+        if ([regex]::Matches($openAIIntegrationContent, $responsePattern).Count -lt 1) {
+            throw "Could not locate OpenAI Responses response converter in $openAIIntegrationGo"
+        }
+        $responseRegex = [regex]::new($responsePattern)
+        $openAIIntegrationContent = $responseRegex.Replace($openAIIntegrationContent, [System.Text.RegularExpressions.MatchEvaluator]{ param($m) $responseReplacement.TrimEnd() }, 1)
+
+        $streamPattern = '(?s)(ResponsesStreamResponseConverter: func\(ctx \*schemas\.BifrostContext, resp \*schemas\.BifrostResponsesStreamResponse\) \(string, interface\{\}, error\) \{\r?\n)(\s*)(if resp\.ExtraFields\.Provider == schemas\.OpenAI)'
+        $openAIIntegrationContent = [regex]::Replace($openAIIntegrationContent, $streamPattern, [System.Text.RegularExpressions.MatchEvaluator]{
+            param($m)
+            "$($m.Groups[1].Value)$($m.Groups[2].Value)if event, payload, handled := restoreCursorAnthropicCustomStream(ctx, resp); handled {`r`n$($m.Groups[2].Value)`treturn event, payload, nil`r`n$($m.Groups[2].Value)}`r`n$($m.Groups[2].Value)$($m.Groups[3].Value)"
+        })
+        Save-Utf8NoBom $openAIIntegrationGo $openAIIntegrationContent
+    }
+    if ([regex]::Matches($openAIIntegrationContent, 'restoreCursorAnthropicCustomStream\(ctx, resp\)').Count -ne 2) {
+        throw "Expected Anthropic custom-tool stream restoration in both OpenAI Responses route variants: $openAIIntegrationGo"
+    }
+
+    $openAIIntegrationContent = Get-Content -Raw -Encoding UTF8 -LiteralPath $openAIIntegrationGo
     if ($openAIIntegrationContent -notmatch 'AppendCursorThinkingHighModels') {
         $cursorListModelsConverter = @'
 			ListModelsResponseConverter: func(ctx *schemas.BifrostContext, resp *schemas.BifrostListModelsResponse) (interface{}, error) {
@@ -921,14 +958,16 @@ func addCursorClaudeSystemCacheBreakpoint(req *openai.OpenAIResponsesRequest) {
 
     $schemaCompatTest = Join-Path $SourceRoot "core\schemas\cursor_connector_compat_test.go"
     $cursorCompatTest = Join-Path $SourceRoot "transports\bifrost-http\integrations\cursor_connector_compat_test.go"
+    $cursorAnthropicCustomToolsTest = Join-Path $SourceRoot "transports\bifrost-http\integrations\cursor_anthropic_custom_tools_test.go"
     $thinkingHighHandlerTest = Join-Path $SourceRoot "transports\bifrost-http\handlers\cursor_thinking_high_test.go"
     Copy-Item -Force (Join-Path $PSScriptRoot "bifrost_responses_compat_test.go") $schemaCompatTest
     Copy-Item -Force (Join-Path $PSScriptRoot "bifrost_cursor_compat_test.go") $cursorCompatTest
+    Copy-Item -Force (Join-Path $PSScriptRoot "bifrost_anthropiccustomtools_test.go") $cursorAnthropicCustomToolsTest
     Copy-Item -Force (Join-Path $PSScriptRoot "bifrost_thinking_high_handler_test.go") $thinkingHighHandlerTest
 
     Push-Location $SourceRoot
     try {
-        & $script:GofmtExe -w $responsesGo $muxGo $cursorGo $cursorToolResultsGo $cursorCompressionGo $thinkingHighGo $thinkingHighTest $inferenceGo $openAIIntegrationGo $schemaCompatTest $cursorCompatTest $thinkingHighHandlerTest
+        & $script:GofmtExe -w $responsesGo $muxGo $cursorGo $cursorToolResultsGo $cursorCompressionGo $cursorAnthropicCustomToolsGo $thinkingHighGo $thinkingHighTest $inferenceGo $openAIIntegrationGo $schemaCompatTest $cursorCompatTest $cursorAnthropicCustomToolsTest $thinkingHighHandlerTest
 
         Push-Location (Join-Path $SourceRoot "core")
         try {
